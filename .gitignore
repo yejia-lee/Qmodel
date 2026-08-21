@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Large generated/data files
+src/data/memmap/mds_ed.csv
+
+*.pt
+*.pth
+*.ckpt
+*.csv
+checkpoints/**
+!checkpoints/**/
+!checkpoints/**/.gitkeep
+
+logs/*
+
+*.patch
+
+*.sh
+
+*.joblib
+*.npy
+*.npz
