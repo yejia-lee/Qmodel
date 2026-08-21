@@ -1,4 +1,4 @@
-## Learning Alarm-Correctness (Q-Models) under Uncertainty-Aware Deterioration Alerts
+## A Model-Agnostic Framework for Post-Hoc False-Alarm Reduction in Clinical Prediction
 
 **Yeji Lee, Keyhyun Ku, Taki Djebbar, Juan Miguel Lopez Alcaraz, Nils Strodthoff** — Carl von Ossietzky Universität Oldenburg
 
