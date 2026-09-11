@@ -1,0 +1,2 @@
+n_val,ece_val_uncalibrated,ece_test_uncalibrated,ece_test_platt,ece_test_isotonic
+5807,0.0153,0.0189,0.0324,0.012

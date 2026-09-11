@@ -1,0 +1,2 @@
+n_val,auroc_val,auroc_test,ece_val_uncalibrated,ece_test_uncalibrated,ece_test_platt,ece_test_isotonic
+5809,0.8314,0.8661,0.025,0.0214,0.0499,0.0411
