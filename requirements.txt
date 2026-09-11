@@ -1,0 +1,15 @@
+# Core numerical and tabular processing
+numpy>=1.24
+pandas>=2.0
+
+# Machine-learning models and evaluation
+scikit-learn>=1.3
+xgboost>=2.0
+joblib>=1.3
+
+# Neural models
+torch>=2.1
+
+# Plotting and explainability
+matplotlib>=3.7
+shap>=0.44

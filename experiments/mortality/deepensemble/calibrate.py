@@ -21,6 +21,7 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 import config
 import sys
 sys.path.insert(0, config.SRC_DIR)
+from clinical_ts.qmodel_protocol import add_protocol_fold, TRAIN_FOLDS, QMODEL_FOLDS, VALIDATION_FOLD, TEST_FOLD
 
 import os
 import warnings
@@ -52,7 +53,7 @@ NPZ_OUT     = os.path.join(CSV_DIR, "calibrated_probs_ensemble_mortality365d.npz
 
 os.makedirs(CSV_DIR, exist_ok=True)
 
-MORTALITY_IDX = 0
+MORTALITY_IDX = 1
 BATCH_SIZE = 32
 LIN_FTRS   = [128, 128, 128]
 M          = 5
@@ -146,7 +147,7 @@ class ShapeCfg:
 # 1. Load & preprocess data (identical to ensemble training script)
 # ============================================================
 print("\nLoading data...")
-df = pd.read_csv(DATA_PATH, low_memory=False)
+df = add_protocol_fold(pd.read_csv(DATA_PATH, low_memory=False))
 
 input_cols = [c for c in df.columns if c.split("_")[0] in ['biometrics','demographics','labvalues','vitals']]
 
@@ -156,17 +157,11 @@ for c in input_cols:
     df[mask_col] = df[c].notna().astype(float)
     mask_columns.append(mask_col)
 
-df_train      = df[df['general_strat_fold'] < 18]
-train_medians = df_train[input_cols].median().to_dict()
+df_train      = df[df['protocol_fold'].isin(TRAIN_FOLDS)]
+train_medians = df_train[input_cols].median().fillna(0).to_dict()
 for c in [c for c, v in df_train[input_cols].isna().sum().items() if v > 0]:
     df.loc[df[c].isna(), c] = train_medians[c]
 df = df.copy()
-
-unique_counts = {c: len(np.unique(np.array(df[c]))) for c in input_cols}
-cat_features  = [c for c, v in unique_counts.items()
-                 if v < 10 and not c.endswith("nan") and not c.startswith("labvalues")]
-cont_features = [c for c in input_cols if c not in cat_features]
-cont_features = cont_features + mask_columns
 
 df["vitals_acuity"] = df["vitals_acuity"].apply(lambda x: int(x) - 1)
 lbl_eth = ['demographics_ethnicity_asian','demographics_ethnicity_black/african',
@@ -179,20 +174,24 @@ if ethnicity_masks:
     df.drop(ethnicity_masks, axis=1, inplace=True)
     mask_columns = [c for c in mask_columns if c not in ethnicity_masks]
 
-input_cols    = [c for c in df.columns if c.split("_")[0] in ['biometrics','demographics','labvalues','vitals']]
-cat_features  = [c for c in input_cols if c in cat_features]
-cont_features = [c for c in input_cols if c not in cat_features]
-
-lbl_itos = ["mortality_365d"]
+input_cols    = [c for c in df.columns if c.split("_")[0] in ['biometrics', 'demographics', 'labvalues', 'vitals']]
+base_feature_cols = [c for c in input_cols if c not in mask_columns]
+unique_counts = {c: len(np.unique(np.array(df[c]))) for c in base_feature_cols}
+cat_features  = [c for c in base_feature_cols if unique_counts[c] < 10 and not c.startswith("labvalues")]
+cont_features = [c for c in base_feature_cols if c not in cat_features] + mask_columns
+lbl_itos = ["icu_24h", "mortality_365d"]
 for c in lbl_itos:
     df["deterioration_" + c] = df["deterioration_" + c].replace(-999., np.nan)
 
-train_df = df[df['general_strat_fold'].isin(range(0, 18))].reset_index(drop=True)
-val_df   = df[df['general_strat_fold'] == 18].reset_index(drop=True)
-test_df  = df[df['general_strat_fold'] == 19].reset_index(drop=True)
+base_train_df = df[df['protocol_fold'].isin(TRAIN_FOLDS)].reset_index(drop=True)
+train_df = df[df['protocol_fold'].isin(QMODEL_FOLDS)].reset_index(drop=True)
+val_df   = df[df['protocol_fold'] == VALIDATION_FOLD].reset_index(drop=True)
+test_df  = df[df['protocol_fold'] == TEST_FOLD].reset_index(drop=True)
+base_train_df = base_train_df[base_train_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
+train_df = train_df[train_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 val_df   = val_df[val_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 test_df  = test_df[test_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
-print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+print(f"Base train: {len(base_train_df)}, Q-model: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
 
 # ============================================================
 # 2. Dataset & DataLoader
@@ -205,12 +204,14 @@ class TabularDataset(Dataset):
     def __len__(self): return len(self.cont)
     def __getitem__(self, i): return self.cont[i], self.cat[i], self.labels[i]
 
+base_train_loader = DataLoader(TabularDataset(base_train_df, cont_features, cat_features, lbl_itos),
+                          batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 train_loader = DataLoader(TabularDataset(train_df, cont_features, cat_features, lbl_itos),
-                          batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+                          batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 val_loader   = DataLoader(TabularDataset(val_df,  cont_features, cat_features, lbl_itos),
-                          batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+                          batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 test_loader  = DataLoader(TabularDataset(test_df, cont_features, cat_features, lbl_itos),
-                          batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+                          batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
 # ============================================================
 # 3. Load 5 pretrained ensemble members & run inference
@@ -225,8 +226,8 @@ mlp_cfg = MLPConfig(
 print(f"\nLoading {M} ensemble members...")
 ensemble_models = []
 for m in range(M):
-    pt_path = os.path.join(config.CKPT_ROOT, "mortality", "deepensemble", f"ensemble_member_{m}_mortality365d_only_mask.pt")
-    model   = BasicEncoderStaticMLP(mlp_cfg, shape, target_dim=len(lbl_itos)).to(DEVICE)
+    pt_path = os.path.join(config.CKPT_ROOT, "multitask", "deepensemble", f"ensemble_member_{m}_joint.pt")
+    model   = BasicEncoderStaticMLP(mlp_cfg, shape, target_dim=2).to(DEVICE)
     model.load_state_dict(torch.load(pt_path, map_location=DEVICE))
     model.eval()
     ensemble_models.append(model)
@@ -261,7 +262,9 @@ def ensemble_predict(models, loader):
 
 
 print("Running ensemble inference...")
-print("  Train set...")
+print("  Base train set...")
+base_train_mean, base_train_var, base_train_ent, base_train_spr, base_train_labels = ensemble_predict(ensemble_models, base_train_loader)
+print("  Q-model set...")
 train_mean, train_var, train_ent, train_spr, train_labels = ensemble_predict(ensemble_models, train_loader)
 print("  Val set...")
 val_mean, val_var, val_ent, val_spr, val_labels = ensemble_predict(ensemble_models, val_loader)
@@ -269,24 +272,30 @@ print("  Test set...")
 test_mean, test_var, test_ent, test_spr, test_labels = ensemble_predict(ensemble_models, test_loader)
 print("  Done.")
 
+base_train_mask = ~np.isnan(base_train_labels[:, MORTALITY_IDX])
+base_train_prob_icu = base_train_mean[base_train_mask, MORTALITY_IDX]
+base_train_true_icu = base_train_labels[base_train_mask, MORTALITY_IDX].astype(int)
 train_mask = ~np.isnan(train_labels[:, MORTALITY_IDX])
 val_mask   = ~np.isnan(val_labels[:,   MORTALITY_IDX])
 test_mask  = ~np.isnan(test_labels[:,  MORTALITY_IDX])
 
 train_prob_icu = train_mean[train_mask,   MORTALITY_IDX]
 train_var_icu  = train_var[train_mask,    MORTALITY_IDX]
+train_std_icu  = np.sqrt(train_var_icu)
 train_ent_icu  = train_ent[train_mask,    MORTALITY_IDX]
 train_spr_icu  = train_spr[train_mask,    MORTALITY_IDX]
 train_true_icu = train_labels[train_mask, MORTALITY_IDX].astype(int)
 
 val_prob_icu = val_mean[val_mask,   MORTALITY_IDX]
 val_var_icu  = val_var[val_mask,    MORTALITY_IDX]
+val_std_icu  = np.sqrt(val_var_icu)
 val_ent_icu  = val_ent[val_mask,    MORTALITY_IDX]
 val_spr_icu  = val_spr[val_mask,    MORTALITY_IDX]
 val_true_icu = val_labels[val_mask, MORTALITY_IDX].astype(int)
 
 test_prob_icu = test_mean[test_mask,   MORTALITY_IDX]
 test_var_icu  = test_var[test_mask,    MORTALITY_IDX]
+test_std_icu  = np.sqrt(test_var_icu)
 test_ent_icu  = test_ent[test_mask,    MORTALITY_IDX]
 test_spr_icu  = test_spr[test_mask,    MORTALITY_IDX]
 test_true_icu = test_labels[test_mask, MORTALITY_IDX].astype(int)
@@ -311,14 +320,14 @@ def compute_ece(y_true, y_prob, n_bins=30):
     return ece
 
 print("\n" + "=" * 70)
-print("Fitting calibrators on VAL split (Platt + Isotonic) — prob_mortality365d only...")
+print("Fitting calibrators on BASE TRAIN split (Platt + Isotonic) — prob_mortality365d only...")
 print("=" * 70)
 
 platt = LogisticRegression(max_iter=1000)
-platt.fit(val_prob_icu.reshape(-1, 1), val_true_icu)
+platt.fit(base_train_prob_icu.reshape(-1, 1), base_train_true_icu)
 
 iso = IsotonicRegression(out_of_bounds="clip")
-iso.fit(val_prob_icu, val_true_icu)
+iso.fit(base_train_prob_icu, base_train_true_icu)
 
 train_prob_icu_platt = platt.predict_proba(train_prob_icu.reshape(-1, 1))[:, 1]
 test_prob_icu_platt  = platt.predict_proba(test_prob_icu.reshape(-1, 1))[:, 1]
@@ -354,11 +363,11 @@ print(f"  Saved: {diag_path}")
 np.savez(
     NPZ_OUT,
     train_mask=train_mask, test_mask=test_mask, val_mask=val_mask,
-    train_prob_icu=train_prob_icu, train_var_icu=train_var_icu,
+    train_prob_icu=train_prob_icu, train_var_icu=train_var_icu, train_std_icu=train_std_icu,
     train_ent_icu=train_ent_icu, train_spr_icu=train_spr_icu, train_true_icu=train_true_icu,
-    val_prob_icu=val_prob_icu, val_var_icu=val_var_icu,
+    val_prob_icu=val_prob_icu, val_var_icu=val_var_icu, val_std_icu=val_std_icu,
     val_ent_icu=val_ent_icu, val_spr_icu=val_spr_icu, val_true_icu=val_true_icu,
-    test_prob_icu=test_prob_icu, test_var_icu=test_var_icu,
+    test_prob_icu=test_prob_icu, test_var_icu=test_var_icu, test_std_icu=test_std_icu,
     test_ent_icu=test_ent_icu, test_spr_icu=test_spr_icu, test_true_icu=test_true_icu,
     train_prob_icu_platt=train_prob_icu_platt, test_prob_icu_platt=test_prob_icu_platt,
     val_prob_icu_platt=val_prob_icu_platt,

@@ -9,8 +9,12 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 import config
+import sys
+sys.path.insert(0, config.SRC_DIR)
+from clinical_ts.qmodel_protocol import add_protocol_fold, TRAIN_FOLDS, VALIDATION_FOLD, TEST_FOLD
 import numpy as np
 import pandas as pd
+import torch
 from sklearn.metrics import roc_auc_score
 from xgboost import XGBClassifier
 import warnings
@@ -24,12 +28,15 @@ TARGET_IDX   = 0  # 'deterioration_mortality_365d' is column 0 in target_columns
 RANDOM_STATE = 42
 
 XGB_BASE_PARAMS = dict(random_state=RANDOM_STATE, n_jobs=4, eval_metric='logloss')
+XGB_BASE_PARAMS.update(tree_method='hist')
+if torch.cuda.is_available():
+    XGB_BASE_PARAMS['device'] = 'cuda'
 
 # ------------------------------------------------------------
 # 1. Load & preprocess data (mask included, same feature space
 #    as BasicMLP / MC Dropout / Deep Ensemble)
 # ------------------------------------------------------------
-df = pd.read_csv(DATA_PATH, low_memory=False)
+df = add_protocol_fold(pd.read_csv(DATA_PATH, low_memory=False))
 
 demographics_columns = [c for c in df.columns if 'demographics_' in c]
 biometrics_columns   = [c for c in df.columns if 'biometrics_' in c]
@@ -37,7 +44,7 @@ vitals_columns       = [c for c in df.columns if 'vitals_' in c]
 labvalues_columns    = [c for c in df.columns if 'labvalues_' in c]
 all_features         = demographics_columns + biometrics_columns + vitals_columns + labvalues_columns
 
-selected_folds = df[df['general_strat_fold'].isin(range(0, 18))]
+selected_folds = df[df['protocol_fold'].isin(TRAIN_FOLDS)]
 medians        = selected_folds[all_features].median()
 
 # Add a mask column per feature: 1 if observed, 0 if missing
@@ -57,10 +64,11 @@ target_columns = [
 # ------------------------------------------------------------
 # 2. Train/Val/Test split
 # ------------------------------------------------------------
-train_df = df[df['general_strat_fold'].isin(range(0, 18))].reset_index(drop=True)
-val_df   = df[df['general_strat_fold'] == 18].reset_index(drop=True)
-test_df  = df[df['general_strat_fold'] == 19].reset_index(drop=True)
+train_df = df[df['protocol_fold'].isin(TRAIN_FOLDS)].reset_index(drop=True)
+val_df   = df[df['protocol_fold'] == VALIDATION_FOLD].reset_index(drop=True)
+test_df  = df[df['protocol_fold'] == TEST_FOLD].reset_index(drop=True)
 
+train_df = train_df[train_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 val_df  = val_df[val_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 test_df = test_df[test_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 
@@ -91,7 +99,7 @@ x_v  = x_val[mask_v]
 x_te = x_test[mask_te]
 
 base_model = XGBClassifier(**XGB_BASE_PARAMS)
-base_model.fit(x_tr, y_tr, eval_set=[(x_v, y_v)], verbose=False)
+base_model.fit(x_tr, y_tr, verbose=False)
 
 train_prob_icu = base_model.predict_proba(x_tr)[:, 1]
 val_prob_icu   = base_model.predict_proba(x_v)[:, 1]
@@ -127,7 +135,7 @@ def find_threshold_for_sensitivity(probs, labels, target_sens=0.80, thr_grid=Non
 
 
 PROB_THRESHOLD, achieved_sens = find_threshold_for_sensitivity(
-    val_prob_icu, val_true_icu, target_sens=0.80
+    val_prob_icu, val_true_icu, target_sens=0.80, thr_grid=np.arange(0.00, 1.01, 0.01)
 )
 print(f"Selected PROB_THRESHOLD={PROB_THRESHOLD:.3f} (val sensitivity={achieved_sens:.4f}, target=0.80)")
 

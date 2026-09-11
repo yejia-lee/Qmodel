@@ -19,9 +19,12 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+LOCAL_DATA_PATH = PROJECT_ROOT / "mds_ed.csv"
 DATA_PATH = os.environ.get(
     "QMODEL_DATA_PATH",
-    "/user/gaad2403/MDS-ED/src/data/memmap/mds_ed.csv",
+    str(LOCAL_DATA_PATH)
+    if LOCAL_DATA_PATH.exists()
+    else "/user/gaad2403/MDS-ED/src/data/memmap/mds_ed.csv",
 )
 
 CKPT_ROOT = os.environ.get(

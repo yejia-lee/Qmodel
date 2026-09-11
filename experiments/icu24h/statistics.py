@@ -21,6 +21,8 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 import config
+sys.path.insert(0, config.SRC_DIR)
+from clinical_ts.qmodel_protocol import add_protocol_fold, TRAIN_FOLDS, TEST_FOLD
 import os
 import warnings
 warnings.filterwarnings('ignore')
@@ -53,7 +55,7 @@ torch.manual_seed(RANDOM_STATE)
 # TEST split only, since we're not retraining anything)
 # ============================================================
 def load_data_with_mask():
-    df = pd.read_csv(DATA_PATH, low_memory=False)
+    df = add_protocol_fold(pd.read_csv(DATA_PATH, low_memory=False))
     input_cols = [c for c in df.columns if c.split("_")[0] in ['biometrics','demographics','labvalues','vitals']]
 
     mask_columns = []
@@ -62,17 +64,11 @@ def load_data_with_mask():
         df[mask_col] = df[c].notna().astype(float)
         mask_columns.append(mask_col)
 
-    df_train      = df[df['general_strat_fold'] < 18]
+    df_train      = df[df['protocol_fold'].isin(TRAIN_FOLDS)]
     train_medians = df_train[input_cols].median().to_dict()
     for c in [c for c, v in df_train[input_cols].isna().sum().items() if v > 0]:
         df.loc[df[c].isna(), c] = train_medians[c]
     df = df.copy()
-
-    unique_counts = {c: len(np.unique(np.array(df[c]))) for c in input_cols}
-    cat_features  = [c for c, v in unique_counts.items()
-                     if v < 10 and not c.endswith("nan") and not c.startswith("labvalues")]
-    cont_features = [c for c in input_cols if c not in cat_features]
-    cont_features = cont_features + mask_columns
 
     df["vitals_acuity"] = df["vitals_acuity"].apply(lambda x: int(x) - 1)
     lbl_eth = ['demographics_ethnicity_asian','demographics_ethnicity_black/african',
@@ -85,13 +81,14 @@ def load_data_with_mask():
         df.drop(ethnicity_masks, axis=1, inplace=True)
         mask_columns = [c for c in mask_columns if c not in ethnicity_masks]
 
-    input_cols    = [c for c in df.columns if c.split("_")[0] in ['biometrics','demographics','labvalues','vitals']]
-    cat_features  = [c for c in input_cols if c in cat_features]
-    cont_features = [c for c in input_cols if c not in cat_features]
-
+    input_cols    = [c for c in df.columns if c.split("_")[0] in ['biometrics', 'demographics', 'labvalues', 'vitals']]
+    base_feature_cols = [c for c in input_cols if c not in mask_columns]
+    unique_counts = {c: len(np.unique(np.array(df[c]))) for c in base_feature_cols}
+    cat_features  = [c for c in base_feature_cols if unique_counts[c] < 10 and not c.startswith("labvalues")]
+    cont_features = [c for c in base_feature_cols if c not in cat_features] + mask_columns
     df["deterioration_icu_24h"] = df["deterioration_icu_24h"].replace(-999., np.nan)
 
-    test_df = df[df['general_strat_fold'] == 19].reset_index(drop=True)
+    test_df = df[df['protocol_fold'] == TEST_FOLD].reset_index(drop=True)
     test_df = test_df[test_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
     return test_df, cont_features, cat_features
 
@@ -168,12 +165,12 @@ CONFIGS = {
     'Deep Ensemble': dict(
         thr=0.11, strategy='Simple', qtype='MLP', q_thr=0.77,
         npz=os.path.join(config.PROJECT_ROOT, "experiments", "icu24h", "deepensemble", "results", "csv", "calibrated_probs_ensemble.npz"),
-        extra_cols=['prob', 'platt', 'iso', 'var', 'ent', 'spr'],
+        extra_cols=['prob', 'platt', 'iso', 'var', 'std', 'ent', 'spr'],
     ),
     'MC Dropout': dict(
         thr=0.13, strategy='CrossFit', qtype='XGB', q_thr=0.85,
         npz=os.path.join(config.PROJECT_ROOT, "experiments", "icu24h", "mcdropout", "results", "csv", "calibrated_probs_mc.npz"),
-        extra_cols=['prob', 'platt', 'iso', 'var', 'ent'],
+        extra_cols=['prob', 'platt', 'iso', 'var', 'std', 'ent'],
     ),
     'XGBoost': dict(
         thr=0.10, strategy='Simple', qtype='XGB', q_thr=0.94,
@@ -187,6 +184,7 @@ EXTRA_COL_KEYS = {
     'platt': ('test_prob_icu_platt', 'prob_icu24h_platt'),
     'iso':   ('test_prob_icu_iso', 'prob_icu24h_isotonic'),
     'var':   ('test_var_icu', 'variance'),
+    'std':   ('test_std_icu', 'std_dev'),
     'ent':   ('test_ent_icu', 'entropy'),
     'spr':   ('test_spr_icu', 'spread'),
 }
@@ -260,7 +258,8 @@ for base_model in MODEL_ORDER:
         vitals_columns       = [c for c in df_full.columns if 'vitals_' in c]
         labvalues_columns    = [c for c in df_full.columns if 'labvalues_' in c]
         all_features = demographics_columns + biometrics_columns + vitals_columns + labvalues_columns
-        selected_folds = df_full[df_full['general_strat_fold'].isin(range(0, 18))]
+        df_full = add_protocol_fold(df_full)
+        selected_folds = df_full[df_full['protocol_fold'].isin(TRAIN_FOLDS)]
         medians = selected_folds[all_features].median()
         mask_columns = []
         for col in all_features:
@@ -269,7 +268,7 @@ for base_model in MODEL_ORDER:
             mask_columns.append(mc)
         df_full[all_features] = df_full[all_features].fillna(medians)
         all_features_with_mask = all_features + mask_columns
-        test_df_x = df_full[df_full['general_strat_fold'] == 19].reset_index(drop=True)
+        test_df_x = df_full[df_full['protocol_fold'] == TEST_FOLD].reset_index(drop=True)
         test_df_x = test_df_x[test_df_x['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
         x_test_full = test_df_x[all_features_with_mask].values.astype(np.float32)
         assert len(test_mask) == len(x_test_full), "mask/df length mismatch for XGBoost — stop."

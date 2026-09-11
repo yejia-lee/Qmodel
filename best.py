@@ -76,20 +76,21 @@ MODELS_MORTALITY365D = {
 
 TARGET_SENS = 0.80
 
-# Must match each original qmodel_sweep_*.py's own PROB_THRESHOLDS exactly,
-# since we can only look up rows that actually exist in that script's CSV.
+# Q-model scripts select one validation-approved base threshold and write the
+# corresponding test rows. Keep the same complete candidate grid here so the
+# validation-only selector remains reproducible from the saved NPZ files.
 PROB_THRESHOLDS_BY_MODEL_ICU24H = {
-    "BasicMLP":      np.round(np.arange(0.00, 0.21, 0.01), 2),  # qmodel_sweep.py started at 0.00
-    "Deep Ensemble":  np.round(np.arange(0.05, 0.21, 0.01), 2),
-    "MC Dropout":     np.round(np.arange(0.05, 0.21, 0.01), 2),
-    "XGBoost":        np.round(np.arange(0.05, 0.21, 0.01), 2),
+    "BasicMLP":       np.round(np.arange(0.00, 1.01, 0.01), 2),
+    "Deep Ensemble":  np.round(np.arange(0.00, 1.01, 0.01), 2),
+    "MC Dropout":     np.round(np.arange(0.00, 1.01, 0.01), 2),
+    "XGBoost":        np.round(np.arange(0.00, 1.01, 0.01), 2),
 }
 
 PROB_THRESHOLDS_BY_MODEL_MORTALITY365D = {
-    "BasicMLP":      np.round(np.arange(0.05, 0.21, 0.01), 2),
-    "Deep Ensemble":  np.round(np.arange(0.05, 0.21, 0.01), 2),
-    "MC Dropout":     np.round(np.arange(0.05, 0.21, 0.01), 2),
-    "XGBoost":        np.round(np.arange(0.05, 0.21, 0.01), 2),
+    "BasicMLP":       np.round(np.arange(0.00, 1.01, 0.01), 2),
+    "Deep Ensemble":  np.round(np.arange(0.00, 1.01, 0.01), 2),
+    "MC Dropout":     np.round(np.arange(0.00, 1.01, 0.01), 2),
+    "XGBoost":        np.round(np.arange(0.00, 1.01, 0.01), 2),
 }
 
 
@@ -186,21 +187,23 @@ def run(models_dict, prob_thresholds_by_model, task_label):
                 TP=r["TP"], FP=r["FP"], FN=r["FN"], TN=r["TN"],
             ))
 
-        # ---- Q-model rows: among sens>=0.80 (already val-selected q_thr
-        #      by qmodel_sweep_*.py), pick the one with max specificity ----
-        qmodel_rows = rows_at_thr[rows_at_thr["strategy"].isin(["Simple", "CrossFit"])].copy()
-        qmodel_rows["sensitivity"] = pd.to_numeric(qmodel_rows["sensitivity"], errors="coerce")
-        qmodel_rows["TN"] = pd.to_numeric(qmodel_rows["TN"], errors="coerce")
-        qmodel_rows["FP"] = pd.to_numeric(qmodel_rows["FP"], errors="coerce")
-        qualifying_q = qmodel_rows[qmodel_rows["sensitivity"] >= TARGET_SENS].copy()
+        # ---- Q-model rows: jointly choose tau, architecture, fitting strategy,
+        # and q-threshold on VAL only. Test columns only report the fixed choice.
+        qmodel_rows = summary_df[summary_df["strategy"] != "Baseline"].copy()
+        qmodel_rows["val_sensitivity"] = pd.to_numeric(qmodel_rows["val_sensitivity"], errors="coerce")
+        qmodel_rows["val_specificity"] = pd.to_numeric(qmodel_rows["val_specificity"], errors="coerce")
+        qmodel_rows["val_FP_reduction_pct"] = pd.to_numeric(qmodel_rows["val_FP_reduction_pct"], errors="coerce")
+        qualifying_q = qmodel_rows[qmodel_rows["val_sensitivity"] >= TARGET_SENS].copy()
 
         if not qualifying_q.empty:
-            qualifying_q["_spec"] = qualifying_q["TN"] / (qualifying_q["TN"] + qualifying_q["FP"])
-            best_q = qualifying_q.loc[qualifying_q["_spec"].idxmax()]
+            best_q = qualifying_q.sort_values(
+                ["val_FP_reduction_pct", "val_specificity", "val_sensitivity"],
+                ascending=False,
+            ).iloc[0]
             final_qmodel_rows.append(dict(
-                Base_Model=model_name, prob_thr=best_thr, q_thr=best_q["best_q_thr"],
+                Base_Model=model_name, prob_thr=best_q["prob_thr"], q_thr=best_q["best_q_thr"],
                 Best_Qmodel=f"{best_q['strategy']} {best_q['model']}",
-                Sensitivity=best_q["sensitivity"], Specificity=round(best_q["_spec"], 4),
+                Sensitivity=best_q["sensitivity"], Specificity=best_q["specificity"],
                 AUROC=best_q["AUROC"], TP=best_q["TP"], FP=best_q["FP"],
                 FN=best_q["FN"], TN=best_q["TN"],
                 FP_Reduction_pct=best_q["FP_reduction_pct"],

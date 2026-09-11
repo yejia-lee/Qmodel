@@ -12,6 +12,13 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 import config
 import sys
 sys.path.insert(0, config.SRC_DIR)
+from clinical_ts.qmodel_protocol import (
+    add_protocol_fold,
+    TRAIN_FOLDS,
+    VALIDATION_FOLD,
+    TEST_FOLD,
+    select_threshold_for_sensitivity,
+)
 
 import torch
 from torch import nn
@@ -30,6 +37,14 @@ matplotlib.use("Agg")
 import os
 import warnings
 warnings.filterwarnings('ignore')
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+torch.manual_seed(RANDOM_STATE)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(RANDOM_STATE)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 # ------------------------------------------------------------
 # Model definition
@@ -115,9 +130,10 @@ LR              = 0.001
 WEIGHT_DECAY    = 0.001
 LIN_FTRS        = [128, 128, 128]
 M               = 5          # number of ensemble members
-PROB_THRESHOLD  = 0.10
+PROB_THRESHOLDS = np.round(np.arange(0.00, 1.01, 0.01), 2)
 EPSILON         = 1e-10
-TARGET_TASK     = "icu_24h"
+TARGET_TASKS    = ["icu_24h", "mortality_365d"]
+TARGET_INDEX    = 0
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
@@ -125,7 +141,7 @@ CSV_DIR     = os.path.join(RESULTS_DIR, "csv")
 PNG_DIR     = os.path.join(RESULTS_DIR, "png")
 os.makedirs(CSV_DIR, exist_ok=True)
 os.makedirs(PNG_DIR, exist_ok=True)
-CKPT_DIR    = os.path.join(config.CKPT_ROOT, "icu24h", "deepensemble")
+CKPT_DIR    = os.path.join(config.CKPT_ROOT, "multitask", "deepensemble")
 os.makedirs(CKPT_DIR, exist_ok=True)
 
 DATA_PATH   = config.DATA_PATH
@@ -133,7 +149,7 @@ DATA_PATH   = config.DATA_PATH
 # ------------------------------------------------------------
 # 1. Load data
 # ------------------------------------------------------------
-df = pd.read_csv(DATA_PATH, low_memory=False)
+df = add_protocol_fold(pd.read_csv(DATA_PATH, low_memory=False))
 
 input_cols = [c for c in df.columns if c.split("_")[0] in ['biometrics', 'demographics', 'labvalues', 'vitals']]
 
@@ -143,18 +159,12 @@ for c in input_cols:
     df[mask_col] = df[c].notna().astype(float)
     mask_columns.append(mask_col)
 
-df_train      = df[df['general_strat_fold'] < 18]
-train_medians = df_train[input_cols].median().to_dict()
+df_train      = df[df['protocol_fold'].isin(TRAIN_FOLDS)]
+train_medians = df_train[input_cols].median().fillna(0).to_dict()
 train_nans    = [c for c, v in df_train[input_cols].isna().sum().to_dict().items() if v > 0]
 for c in train_nans:
     df.loc[df[c].isna(), c] = train_medians[c]
 df = df.copy()
-
-unique_counts = {c: len(np.unique(np.array(df[c]))) for c in input_cols}
-cat_features  = [c for c, v in unique_counts.items()
-                 if v < 10 and not c.endswith("nan") and not c.startswith("labvalues")]
-cont_features = [c for c in input_cols if c not in cat_features]
-cont_features = cont_features + mask_columns
 
 df["vitals_acuity"] = df["vitals_acuity"].apply(lambda x: int(x) - 1)
 
@@ -175,18 +185,21 @@ if ethnicity_masks:
     mask_columns = [c for c in mask_columns if c not in ethnicity_masks]
 
 input_cols    = [c for c in df.columns if c.split("_")[0] in ['biometrics', 'demographics', 'labvalues', 'vitals']]
-cat_features  = [c for c in input_cols if c in cat_features]
-cont_features = [c for c in input_cols if c not in cat_features]
-
-df["deterioration_" + TARGET_TASK] = df["deterioration_" + TARGET_TASK].replace(-999., np.nan)
+base_feature_cols = [c for c in input_cols if c not in mask_columns]
+unique_counts = {c: len(np.unique(np.array(df[c]))) for c in base_feature_cols}
+cat_features  = [c for c in base_feature_cols if unique_counts[c] < 10 and not c.startswith("labvalues")]
+cont_features = [c for c in base_feature_cols if c not in cat_features] + mask_columns
+for target_task in TARGET_TASKS:
+    df["deterioration_" + target_task] = df["deterioration_" + target_task].replace(-999., np.nan)
 
 # ------------------------------------------------------------
 # 2. Split
 # ------------------------------------------------------------
-train_df = df[df['general_strat_fold'].isin(range(0, 18))].reset_index(drop=True)
-val_df   = df[df['general_strat_fold'] == 18].reset_index(drop=True)
-test_df  = df[df['general_strat_fold'] == 19].reset_index(drop=True)
+train_df = df[df['protocol_fold'].isin(TRAIN_FOLDS)].reset_index(drop=True)
+val_df   = df[df['protocol_fold'] == VALIDATION_FOLD].reset_index(drop=True)
+test_df  = df[df['protocol_fold'] == TEST_FOLD].reset_index(drop=True)
 
+train_df = train_df[train_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 val_df  = val_df[val_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 test_df = test_df[test_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 
@@ -194,20 +207,23 @@ test_df = test_df[test_df['general_ecg_no_within_stay'] == 0].reset_index(drop=T
 # 3. Dataset
 # ------------------------------------------------------------
 class TabularDataset(Dataset):
-    def __init__(self, df, cont_features, cat_features, target_task):
+    def __init__(self, df, cont_features, cat_features, target_tasks):
         self.cont   = torch.tensor(df[cont_features].values, dtype=torch.float32)
         self.cat    = torch.tensor(df[cat_features].values,  dtype=torch.long)
-        self.labels = torch.tensor(df[["deterioration_" + target_task]].values, dtype=torch.float32)
+        self.labels = torch.tensor(
+            df[["deterioration_" + task for task in target_tasks]].values,
+            dtype=torch.float32,
+        )
     def __len__(self): return len(self.cont)
     def __getitem__(self, idx): return self.cont[idx], self.cat[idx], self.labels[idx]
 
-train_ds = TabularDataset(train_df, cont_features, cat_features, TARGET_TASK)
-val_ds   = TabularDataset(val_df,   cont_features, cat_features, TARGET_TASK)
-test_ds  = TabularDataset(test_df,  cont_features, cat_features, TARGET_TASK)
+train_ds = TabularDataset(train_df, cont_features, cat_features, TARGET_TASKS)
+val_ds   = TabularDataset(val_df,   cont_features, cat_features, TARGET_TASKS)
+test_ds  = TabularDataset(test_df,  cont_features, cat_features, TARGET_TASKS)
 
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=4)
-val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
-test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
 # ------------------------------------------------------------
 # 4. Model config
@@ -235,9 +251,9 @@ mlp_cfg = MLPConfig(
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def build_model():
-    return BasicEncoderStaticMLP(mlp_cfg, shape, target_dim=1)
+    return BasicEncoderStaticMLP(mlp_cfg, shape, target_dim=len(TARGET_TASKS))
 
-def icu24h_loss(preds, targets):
+def multitask_loss(preds, targets):
     mask = ~torch.isnan(targets)
     if mask.sum() == 0:
         return torch.tensor(0.0, requires_grad=True)
@@ -251,14 +267,17 @@ ensemble_models = []
 for m in range(M):
     print(f"--- Member {m+1}/{M} ---")
 
-    torch.manual_seed(m * 42)
-    np.random.seed(m * 42)
+    member_seed = RANDOM_STATE + m
+    torch.manual_seed(member_seed)
+    np.random.seed(member_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(member_seed)
 
     model     = build_model().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    best_val_auroc_icu24h = 0
-    best_epoch             = 0
+    best_val_auroc_icu24h = -float("inf")
+    best_epoch = None
 
     for epoch in range(EPOCHS):
         model.train()
@@ -266,8 +285,9 @@ for m in range(M):
         for cont, cat, labels in train_loader:
             cont, cat, labels = cont.to(device), cat.to(device), labels.to(device)
             optimizer.zero_grad()
-            loss = icu24h_loss(model(static=cont, static_cat=cat)["static"], labels)
+            loss = multitask_loss(model(static=cont, static_cat=cat)["static"], labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_loss += loss.item()
 
@@ -282,9 +302,11 @@ for m in range(M):
         all_preds  = np.concatenate(all_preds)
         all_labels = np.concatenate(all_labels)
 
-        mask = ~np.isnan(all_labels[:, 0])
-        if mask.sum() > 0 and len(np.unique(all_labels[mask, 0])) > 1:
-            val_auroc_icu24h = roc_auc_score(all_labels[mask, 0], all_preds[mask, 0])
+        mask = ~np.isnan(all_labels[:, TARGET_INDEX])
+        if mask.sum() > 0 and len(np.unique(all_labels[mask, TARGET_INDEX])) > 1:
+            val_auroc_icu24h = roc_auc_score(
+                all_labels[mask, TARGET_INDEX], all_preds[mask, TARGET_INDEX]
+            )
         else:
             val_auroc_icu24h = float('nan')
 
@@ -292,11 +314,11 @@ for m in range(M):
 
         if not np.isnan(val_auroc_icu24h) and val_auroc_icu24h > best_val_auroc_icu24h:
             best_val_auroc_icu24h = val_auroc_icu24h
-            best_epoch             = epoch + 1
-            torch.save(model.state_dict(), os.path.join(CKPT_DIR, f"ensemble_member_{m}_icu24h_only_mask.pt"))
+            best_epoch = epoch + 1
+            torch.save(model.state_dict(), os.path.join(CKPT_DIR, f"ensemble_member_{m}_joint.pt"))
 
     print(f"  best val AUROC {best_val_auroc_icu24h:.4f} at epoch {best_epoch}")
-    model.load_state_dict(torch.load(os.path.join(CKPT_DIR, f"ensemble_member_{m}_icu24h_only_mask.pt"), map_location=device))
+    model.load_state_dict(torch.load(os.path.join(CKPT_DIR, f"ensemble_member_{m}_joint.pt"), map_location=device))
     model.eval()
     ensemble_models.append(model)
 
@@ -333,6 +355,17 @@ def ensemble_predict(models, loader, device):
 print("Running ensemble inference...")
 val_mean, val_var, val_entropy, val_spread, val_labels = ensemble_predict(ensemble_models, val_loader, device)
 test_mean, test_var, test_entropy, test_spread, test_labels = ensemble_predict(ensemble_models, test_loader, device)
+
+val_valid = ~np.isnan(val_labels[:, TARGET_INDEX])
+PROB_THRESHOLD, val_sensitivity = select_threshold_for_sensitivity(
+    val_mean[val_valid, TARGET_INDEX],
+    val_labels[val_valid, TARGET_INDEX].astype(int),
+    PROB_THRESHOLDS,
+)
+print(
+    f"Selected base threshold={PROB_THRESHOLD:.2f} "
+    f"(validation sensitivity={val_sensitivity:.4f})"
+)
 
 # ------------------------------------------------------------
 # 7. Q-model feature export

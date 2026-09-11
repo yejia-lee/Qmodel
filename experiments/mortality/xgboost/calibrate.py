@@ -18,12 +18,16 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 import config
+import sys
+sys.path.insert(0, config.SRC_DIR)
+from clinical_ts.qmodel_protocol import add_protocol_fold, TRAIN_FOLDS, QMODEL_FOLDS, VALIDATION_FOLD, TEST_FOLD
 import os
 import warnings
 warnings.filterwarnings('ignore')
 
 import numpy as np
 import pandas as pd
+import torch
 from sklearn.metrics import roc_auc_score
 from sklearn.linear_model import LogisticRegression
 from sklearn.isotonic import IsotonicRegression
@@ -43,12 +47,15 @@ os.makedirs(CSV_DIR, exist_ok=True)
 MORTALITY_IDX   = 0  # 'deterioration_mortality_365d' is column 0 in target_columns
 RANDOM_STATE    = 42
 XGB_BASE_PARAMS = dict(random_state=RANDOM_STATE, n_jobs=4, eval_metric='logloss')
+XGB_BASE_PARAMS.update(tree_method='hist')
+if torch.cuda.is_available():
+    XGB_BASE_PARAMS['device'] = 'cuda'
 
 # ============================================================
 # 1. Load & preprocess data (mask included, same as sweep script)
 # ============================================================
 print("\nLoading data...")
-df = pd.read_csv(DATA_PATH, low_memory=False)
+df = add_protocol_fold(pd.read_csv(DATA_PATH, low_memory=False))
 print(f"shape: {df.shape}")
 
 demographics_columns = [c for c in df.columns if 'demographics_' in c]
@@ -57,7 +64,7 @@ vitals_columns       = [c for c in df.columns if 'vitals_' in c]
 labvalues_columns    = [c for c in df.columns if 'labvalues_' in c]
 all_features         = demographics_columns + biometrics_columns + vitals_columns + labvalues_columns
 
-selected_folds = df[df['general_strat_fold'].isin(range(0, 18))]
+selected_folds = df[df['protocol_fold'].isin(TRAIN_FOLDS)]
 medians        = selected_folds[all_features].median()
 
 mask_columns = []
@@ -78,22 +85,27 @@ target_columns = [
 # ============================================================
 # 2. Train/Val/Test split
 # ============================================================
-train_df = df[df['general_strat_fold'].isin(range(0, 18))].reset_index(drop=True)
-val_df   = df[df['general_strat_fold'] == 18].reset_index(drop=True)
-test_df  = df[df['general_strat_fold'] == 19].reset_index(drop=True)
+train_df = df[df['protocol_fold'].isin(TRAIN_FOLDS)].reset_index(drop=True)
+qmodel_df = df[df['protocol_fold'].isin(QMODEL_FOLDS)].reset_index(drop=True)
+val_df   = df[df['protocol_fold'] == VALIDATION_FOLD].reset_index(drop=True)
+test_df  = df[df['protocol_fold'] == TEST_FOLD].reset_index(drop=True)
 
+train_df = train_df[train_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
+qmodel_df = qmodel_df[qmodel_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 val_df  = val_df[val_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 test_df = test_df[test_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 
 x_train = train_df[all_features_with_mask].values
+x_qmodel = qmodel_df[all_features_with_mask].values
 x_val   = val_df[all_features_with_mask].values
 x_test  = test_df[all_features_with_mask].values
 
 y_train = train_df[target_columns].values
+y_qmodel = qmodel_df[target_columns].values
 y_val   = val_df[target_columns].values
 y_test  = test_df[target_columns].values
 
-print(f"Train: {x_train.shape}, Val: {x_val.shape}, Test: {x_test.shape}")
+print(f"Base train: {x_train.shape}, Q-model: {x_qmodel.shape}, Val: {x_val.shape}, Test: {x_test.shape}")
 
 # ============================================================
 # 3. Train XGBoost base model (365d mortality target only)
@@ -101,27 +113,32 @@ print(f"Train: {x_train.shape}, Val: {x_val.shape}, Test: {x_test.shape}")
 print("\nTraining XGBoost base model (365d mortality, mask included)...")
 
 i = MORTALITY_IDX
-y_tr_raw = y_train[:, i]; y_v_raw = y_val[:, i]; y_te_raw = y_test[:, i]
+y_tr_raw = y_train[:, i]; y_q_raw = y_qmodel[:, i]; y_v_raw = y_val[:, i]; y_te_raw = y_test[:, i]
 
 mask_tr = y_tr_raw != -999
+mask_q  = y_q_raw  != -999
 mask_v  = y_v_raw  != -999
 mask_te = y_te_raw != -999
 
 y_tr = y_tr_raw[mask_tr].astype(int)
+y_q  = y_q_raw[mask_q].astype(int)
 y_v  = y_v_raw[mask_v].astype(int)
 y_te = y_te_raw[mask_te].astype(int)
 
 x_tr = x_train[mask_tr]
+x_q = x_qmodel[mask_q]
 x_v  = x_val[mask_v]
 x_te = x_test[mask_te]
 
 base_model = XGBClassifier(**XGB_BASE_PARAMS)
-base_model.fit(x_tr, y_tr, eval_set=[(x_v, y_v)], verbose=False)
+base_model.fit(x_tr, y_tr, verbose=False)
 
 train_prob_icu = base_model.predict_proba(x_tr)[:, 1]
+qmodel_prob_icu = base_model.predict_proba(x_q)[:, 1]
 val_prob_icu   = base_model.predict_proba(x_v)[:, 1]
 test_prob_icu  = base_model.predict_proba(x_te)[:, 1]
 train_true_icu = y_tr
+qmodel_true_icu = y_q
 val_true_icu   = y_v
 test_true_icu  = y_te
 
@@ -146,20 +163,22 @@ def compute_ece(y_true, y_prob, n_bins=30):
     return ece
 
 print("\n" + "=" * 70)
-print("Fitting calibrators on VAL split (Platt + Isotonic)...")
+print("Fitting calibrators on BASE TRAIN split (Platt + Isotonic)...")
 print("=" * 70)
 
 platt = LogisticRegression(max_iter=1000)
-platt.fit(val_prob_icu.reshape(-1, 1), val_true_icu)
+platt.fit(train_prob_icu.reshape(-1, 1), train_true_icu)
 
 iso = IsotonicRegression(out_of_bounds="clip")
-iso.fit(val_prob_icu, val_true_icu)
+iso.fit(train_prob_icu, train_true_icu)
 
 train_prob_icu_platt = platt.predict_proba(train_prob_icu.reshape(-1, 1))[:, 1]
+qmodel_prob_icu_platt = platt.predict_proba(qmodel_prob_icu.reshape(-1, 1))[:, 1]
 test_prob_icu_platt  = platt.predict_proba(test_prob_icu.reshape(-1, 1))[:, 1]
 val_prob_icu_platt   = platt.predict_proba(val_prob_icu.reshape(-1, 1))[:, 1]
 
 train_prob_icu_iso = iso.predict(train_prob_icu)
+qmodel_prob_icu_iso = iso.predict(qmodel_prob_icu)
 test_prob_icu_iso  = iso.predict(test_prob_icu)
 val_prob_icu_iso   = iso.predict(val_prob_icu)
 
@@ -187,18 +206,18 @@ print(f"  Saved: {diag_path}")
 
 # ============================================================
 # 5. Save everything qmodel_sweep_xgb_mortality365d.py needs
-#    (includes mask_tr / mask_te so the sweep script can rebuild
+#    (includes train_mask / val_mask / test_mask so the sweep script can rebuild
 #     X_train_features / X_test_features without retraining anything)
 # ============================================================
 np.savez(
     NPZ_OUT,
-    mask_tr=mask_tr, mask_v=mask_v, mask_te=mask_te,
-    train_prob_icu=train_prob_icu, train_true_icu=train_true_icu,
+    train_mask=mask_q, val_mask=mask_v, test_mask=mask_te,
+    train_prob_icu=qmodel_prob_icu, train_true_icu=qmodel_true_icu,
     val_prob_icu=val_prob_icu, val_true_icu=val_true_icu,
     test_prob_icu=test_prob_icu, test_true_icu=test_true_icu,
-    train_prob_icu_platt=train_prob_icu_platt, test_prob_icu_platt=test_prob_icu_platt,
+    train_prob_icu_platt=qmodel_prob_icu_platt, test_prob_icu_platt=test_prob_icu_platt,
     val_prob_icu_platt=val_prob_icu_platt,
-    train_prob_icu_iso=train_prob_icu_iso, test_prob_icu_iso=test_prob_icu_iso,
+    train_prob_icu_iso=qmodel_prob_icu_iso, test_prob_icu_iso=test_prob_icu_iso,
     val_prob_icu_iso=val_prob_icu_iso,
 )
 

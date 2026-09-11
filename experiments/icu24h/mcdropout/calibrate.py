@@ -17,6 +17,7 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 import config
 import sys
 sys.path.insert(0, config.SRC_DIR)
+from clinical_ts.qmodel_protocol import add_protocol_fold, TRAIN_FOLDS, QMODEL_FOLDS, VALIDATION_FOLD, TEST_FOLD
 
 import os
 import warnings
@@ -44,7 +45,7 @@ BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 CSV_DIR     = os.path.join(RESULTS_DIR, "csv")
 DATA_PATH   = config.DATA_PATH
-PT_PATH     = os.path.join(config.CKPT_ROOT, "icu24h", "mcdropout", "best_mcdropout_icu24h_only_mask.pt")
+PT_PATH     = os.path.join(config.CKPT_ROOT, "multitask", "mcdropout", "best_mcdropout_joint.pt")
 NPZ_OUT     = os.path.join(CSV_DIR, "calibrated_probs_mc.npz")
 
 os.makedirs(CSV_DIR, exist_ok=True)
@@ -143,7 +144,7 @@ class ShapeCfg:
 # 1. Load & preprocess data (identical to qmodel sweep script for MC Dropout)
 # ============================================================
 print("\nLoading data...")
-df = pd.read_csv(DATA_PATH, low_memory=False)
+df = add_protocol_fold(pd.read_csv(DATA_PATH, low_memory=False))
 
 input_cols = [c for c in df.columns if c.split("_")[0] in ['biometrics','demographics','labvalues','vitals']]
 
@@ -153,17 +154,11 @@ for c in input_cols:
     df[mask_col] = df[c].notna().astype(float)
     mask_columns.append(mask_col)
 
-df_train      = df[df['general_strat_fold'] < 18]
-train_medians = df_train[input_cols].median().to_dict()
+df_train      = df[df['protocol_fold'].isin(TRAIN_FOLDS)]
+train_medians = df_train[input_cols].median().fillna(0).to_dict()
 for c in [c for c, v in df_train[input_cols].isna().sum().items() if v > 0]:
     df.loc[df[c].isna(), c] = train_medians[c]
 df = df.copy()
-
-unique_counts = {c: len(np.unique(np.array(df[c]))) for c in input_cols}
-cat_features  = [c for c, v in unique_counts.items()
-                 if v < 10 and not c.endswith("nan") and not c.startswith("labvalues")]
-cont_features = [c for c in input_cols if c not in cat_features]
-cont_features = cont_features + mask_columns
 
 df["vitals_acuity"] = df["vitals_acuity"].apply(lambda x: int(x) - 1)
 lbl_eth = ['demographics_ethnicity_asian','demographics_ethnicity_black/african',
@@ -176,20 +171,24 @@ if ethnicity_masks:
     df.drop(ethnicity_masks, axis=1, inplace=True)
     mask_columns = [c for c in mask_columns if c not in ethnicity_masks]
 
-input_cols    = [c for c in df.columns if c.split("_")[0] in ['biometrics','demographics','labvalues','vitals']]
-cat_features  = [c for c in input_cols if c in cat_features]
-cont_features = [c for c in input_cols if c not in cat_features]
-
-lbl_itos = ["icu_24h"]
+input_cols    = [c for c in df.columns if c.split("_")[0] in ['biometrics', 'demographics', 'labvalues', 'vitals']]
+base_feature_cols = [c for c in input_cols if c not in mask_columns]
+unique_counts = {c: len(np.unique(np.array(df[c]))) for c in base_feature_cols}
+cat_features  = [c for c in base_feature_cols if unique_counts[c] < 10 and not c.startswith("labvalues")]
+cont_features = [c for c in base_feature_cols if c not in cat_features] + mask_columns
+lbl_itos = ["icu_24h", "mortality_365d"]
 for c in lbl_itos:
     df["deterioration_" + c] = df["deterioration_" + c].replace(-999., np.nan)
 
-train_df = df[df['general_strat_fold'].isin(range(0, 18))].reset_index(drop=True)
-val_df   = df[df['general_strat_fold'] == 18].reset_index(drop=True)
-test_df  = df[df['general_strat_fold'] == 19].reset_index(drop=True)
+base_train_df = df[df['protocol_fold'].isin(TRAIN_FOLDS)].reset_index(drop=True)
+train_df = df[df['protocol_fold'].isin(QMODEL_FOLDS)].reset_index(drop=True)
+val_df   = df[df['protocol_fold'] == VALIDATION_FOLD].reset_index(drop=True)
+test_df  = df[df['protocol_fold'] == TEST_FOLD].reset_index(drop=True)
+base_train_df = base_train_df[base_train_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
+train_df = train_df[train_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 val_df   = val_df[val_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 test_df  = test_df[test_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
-print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+print(f"Base train: {len(base_train_df)}, Q-model: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
 
 # ============================================================
 # 2. Dataset & DataLoader
@@ -202,12 +201,14 @@ class TabularDataset(Dataset):
     def __len__(self): return len(self.cont)
     def __getitem__(self, i): return self.cont[i], self.cat[i], self.labels[i]
 
+base_train_loader = DataLoader(TabularDataset(base_train_df, cont_features, cat_features, lbl_itos),
+                          batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 train_loader = DataLoader(TabularDataset(train_df, cont_features, cat_features, lbl_itos),
-                          batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+                          batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 val_loader   = DataLoader(TabularDataset(val_df,  cont_features, cat_features, lbl_itos),
-                          batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+                          batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 test_loader  = DataLoader(TabularDataset(test_df, cont_features, cat_features, lbl_itos),
-                          batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+                          batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
 # ============================================================
 # 3. Load pretrained MC Dropout model & run T=50 stochastic passes
@@ -218,13 +219,20 @@ mlp_cfg = MLPConfig(
     vocab_sizes=[unique_counts[c] for c in cat_features],
     lin_ftrs=LIN_FTRS
 )
-encoder = BasicEncoderStaticMLP(mlp_cfg, shape, target_dim=1).to(DEVICE)
+encoder = BasicEncoderStaticMLP(mlp_cfg, shape, target_dim=2).to(DEVICE)
 encoder.load_state_dict(torch.load(PT_PATH, map_location=DEVICE))
 print(f"Loaded: {PT_PATH}")
 
 
+def enable_mc_dropout(model):
+    model.eval()
+    for module in model.modules():
+        if isinstance(module, nn.Dropout):
+            module.train()
+
+
 def mc_dropout_predict(loader, model, T=50):
-    model.train()  # IMPORTANT: keep dropout active for MC sampling
+    enable_mc_dropout(model)
     all_samples, all_labels = [], []
     with torch.no_grad():
         for cont, cat, labels in loader:
@@ -232,9 +240,9 @@ def mc_dropout_predict(loader, model, T=50):
             batch_samples = []
             for _ in range(T):
                 probs = torch.sigmoid(model(static=cont, static_cat=cat)["static"]).cpu().numpy()
-                batch_samples.append(probs.squeeze(-1))
+                batch_samples.append(probs)
             all_samples.append(np.stack(batch_samples, axis=0))
-            all_labels.append(labels.numpy().squeeze(-1))
+            all_labels.append(labels.numpy())
 
     all_samples = np.concatenate(all_samples, axis=1)
     all_labels  = np.concatenate(all_labels,  axis=0)
@@ -248,7 +256,9 @@ def mc_dropout_predict(loader, model, T=50):
 
 
 print(f"\nRunning MC Dropout inference (T={MC_SAMPLES})...")
-print("  Train set...")
+print("  Base train set...")
+base_train_mean, base_train_var, base_train_ent, base_train_labels = mc_dropout_predict(base_train_loader, encoder, MC_SAMPLES)
+print("  Q-model set...")
 train_mean, train_var, train_ent, train_labels = mc_dropout_predict(train_loader, encoder, MC_SAMPLES)
 print("  Val set...")
 val_mean, val_var, val_ent, val_labels = mc_dropout_predict(val_loader, encoder, MC_SAMPLES)
@@ -256,31 +266,37 @@ print("  Test set...")
 test_mean, test_var, test_ent, test_labels = mc_dropout_predict(test_loader, encoder, MC_SAMPLES)
 print("  Done.")
 
-train_mask = ~np.isnan(train_labels)
-val_mask   = ~np.isnan(val_labels)
-test_mask  = ~np.isnan(test_labels)
+base_train_mask = ~np.isnan(base_train_labels[:, ICU24H_IDX])
+base_train_prob_icu = base_train_mean[:, ICU24H_IDX][base_train_mask]
+base_train_true_icu = base_train_labels[:, ICU24H_IDX][base_train_mask].astype(int)
+train_mask = ~np.isnan(train_labels[:, ICU24H_IDX])
+val_mask   = ~np.isnan(val_labels[:, ICU24H_IDX])
+test_mask  = ~np.isnan(test_labels[:, ICU24H_IDX])
 
-train_prob_icu = train_mean[train_mask]
-train_var_icu  = train_var[train_mask]
-train_ent_icu  = train_ent[train_mask]
-train_true_icu = train_labels[train_mask].astype(int)
+train_prob_icu = train_mean[:, ICU24H_IDX][train_mask]
+train_var_icu  = train_var[:, ICU24H_IDX][train_mask]
+train_std_icu  = np.sqrt(train_var_icu)
+train_ent_icu  = train_ent[:, ICU24H_IDX][train_mask]
+train_true_icu = train_labels[:, ICU24H_IDX][train_mask].astype(int)
 
-val_prob_icu = val_mean[val_mask]
-val_var_icu  = val_var[val_mask]
-val_ent_icu  = val_ent[val_mask]
-val_true_icu = val_labels[val_mask].astype(int)
+val_prob_icu = val_mean[:, ICU24H_IDX][val_mask]
+val_var_icu  = val_var[:, ICU24H_IDX][val_mask]
+val_std_icu  = np.sqrt(val_var_icu)
+val_ent_icu  = val_ent[:, ICU24H_IDX][val_mask]
+val_true_icu = val_labels[:, ICU24H_IDX][val_mask].astype(int)
 
-test_prob_icu = test_mean[test_mask]
-test_var_icu  = test_var[test_mask]
-test_ent_icu  = test_ent[test_mask]
-test_true_icu = test_labels[test_mask].astype(int)
+test_prob_icu = test_mean[:, ICU24H_IDX][test_mask]
+test_var_icu  = test_var[:, ICU24H_IDX][test_mask]
+test_std_icu  = np.sqrt(test_var_icu)
+test_ent_icu  = test_ent[:, ICU24H_IDX][test_mask]
+test_true_icu = test_labels[:, ICU24H_IDX][test_mask].astype(int)
 
 print(f"Train ICU samples: {len(train_prob_icu)}")
 print(f"Val   ICU samples: {len(val_prob_icu)}")
 print(f"Test  ICU samples: {len(test_prob_icu)}")
 
 # ============================================================
-# 4. Calibration: fit Platt + Isotonic on VAL's mean probability ONLY.
+# 4. Calibration: fit Platt + Isotonic on BASE TRAIN's mean probability ONLY.
 #    variance / entropy are uncertainty measures, not probabilities,
 #    so they are NOT calibrated — carried through unchanged.
 # ============================================================
@@ -295,14 +311,14 @@ def compute_ece(y_true, y_prob, n_bins=30):
     return ece
 
 print("\n" + "=" * 70)
-print("Fitting calibrators on VAL split (Platt + Isotonic) — prob_icu24h only...")
+print("Fitting calibrators on BASE TRAIN split (Platt + Isotonic) — prob_icu24h only...")
 print("=" * 70)
 
 platt = LogisticRegression(max_iter=1000)
-platt.fit(val_prob_icu.reshape(-1, 1), val_true_icu)
+platt.fit(base_train_prob_icu.reshape(-1, 1), base_train_true_icu)
 
 iso = IsotonicRegression(out_of_bounds="clip")
-iso.fit(val_prob_icu, val_true_icu)
+iso.fit(base_train_prob_icu, base_train_true_icu)
 
 train_prob_icu_platt = platt.predict_proba(train_prob_icu.reshape(-1, 1))[:, 1]
 test_prob_icu_platt  = platt.predict_proba(test_prob_icu.reshape(-1, 1))[:, 1]
@@ -338,11 +354,11 @@ print(f"  Saved: {diag_path}")
 np.savez(
     NPZ_OUT,
     train_mask=train_mask, test_mask=test_mask, val_mask=val_mask,
-    train_prob_icu=train_prob_icu, train_var_icu=train_var_icu,
+    train_prob_icu=train_prob_icu, train_var_icu=train_var_icu, train_std_icu=train_std_icu,
     train_ent_icu=train_ent_icu, train_true_icu=train_true_icu,
-    val_prob_icu=val_prob_icu, val_var_icu=val_var_icu,
+    val_prob_icu=val_prob_icu, val_var_icu=val_var_icu, val_std_icu=val_std_icu,
     val_ent_icu=val_ent_icu, val_true_icu=val_true_icu,
-    test_prob_icu=test_prob_icu, test_var_icu=test_var_icu,
+    test_prob_icu=test_prob_icu, test_var_icu=test_var_icu, test_std_icu=test_std_icu,
     test_ent_icu=test_ent_icu, test_true_icu=test_true_icu,
     train_prob_icu_platt=train_prob_icu_platt, test_prob_icu_platt=test_prob_icu_platt,
     val_prob_icu_platt=val_prob_icu_platt,

@@ -13,6 +13,7 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 import config
 import sys
 sys.path.insert(0, config.SRC_DIR)
+from clinical_ts.qmodel_protocol import add_protocol_fold, TRAIN_FOLDS, QMODEL_FOLDS, VALIDATION_FOLD, TEST_FOLD
 
 import os
 import warnings
@@ -40,7 +41,7 @@ BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 CSV_DIR     = os.path.join(RESULTS_DIR, "csv")
 DATA_PATH   = config.DATA_PATH
-PT_PATH     = os.path.join(config.CKPT_ROOT, "icu24h", "basicmlp", "best_basicmlp_icu24h_only.pt")
+PT_PATH     = os.path.join(config.CKPT_ROOT, "multitask", "basicmlp", "best_basicmlp_joint.pt")
 NPZ_OUT     = os.path.join(CSV_DIR, "calibrated_probs.npz")
 
 os.makedirs(CSV_DIR, exist_ok=True)
@@ -135,7 +136,7 @@ class ShapeCfg:
 # 1. Load & preprocess data (identical to qmodel sweep script)
 # ============================================================
 print("\nLoading data...")
-df = pd.read_csv(DATA_PATH, low_memory=False)
+df = add_protocol_fold(pd.read_csv(DATA_PATH, low_memory=False))
 
 input_cols = [c for c in df.columns if c.split("_")[0] in ['biometrics','demographics','labvalues','vitals']]
 
@@ -145,17 +146,11 @@ for c in input_cols:
     df[mask_col] = df[c].notna().astype(float)
     mask_columns.append(mask_col)
 
-df_train      = df[df['general_strat_fold'] < 18]
-train_medians = df_train[input_cols].median().to_dict()
+df_train      = df[df['protocol_fold'].isin(TRAIN_FOLDS)]
+train_medians = df_train[input_cols].median().fillna(0).to_dict()
 for c in [c for c, v in df_train[input_cols].isna().sum().items() if v > 0]:
     df.loc[df[c].isna(), c] = train_medians[c]
 df = df.copy()
-
-unique_counts = {c: len(np.unique(np.array(df[c]))) for c in input_cols}
-cat_features  = [c for c, v in unique_counts.items()
-                 if v < 10 and not c.endswith("nan") and not c.startswith("labvalues")]
-cont_features = [c for c in input_cols if c not in cat_features]
-cont_features = cont_features + mask_columns
 
 df["vitals_acuity"] = df["vitals_acuity"].apply(lambda x: int(x) - 1)
 lbl_eth = ['demographics_ethnicity_asian','demographics_ethnicity_black/african',
@@ -168,20 +163,24 @@ if ethnicity_masks:
     df.drop(ethnicity_masks, axis=1, inplace=True)
     mask_columns = [c for c in mask_columns if c not in ethnicity_masks]
 
-input_cols    = [c for c in df.columns if c.split("_")[0] in ['biometrics','demographics','labvalues','vitals']]
-cat_features  = [c for c in input_cols if c in cat_features]
-cont_features = [c for c in input_cols if c not in cat_features]
-
-lbl_itos = ["icu_24h"]
+input_cols    = [c for c in df.columns if c.split("_")[0] in ['biometrics', 'demographics', 'labvalues', 'vitals']]
+base_feature_cols = [c for c in input_cols if c not in mask_columns]
+unique_counts = {c: len(np.unique(np.array(df[c]))) for c in base_feature_cols}
+cat_features  = [c for c in base_feature_cols if unique_counts[c] < 10 and not c.startswith("labvalues")]
+cont_features = [c for c in base_feature_cols if c not in cat_features] + mask_columns
+lbl_itos = ["icu_24h", "mortality_365d"]
 for c in lbl_itos:
     df["deterioration_" + c] = df["deterioration_" + c].replace(-999., np.nan)
 
-train_df = df[df['general_strat_fold'].isin(range(0, 18))].reset_index(drop=True)
-val_df   = df[df['general_strat_fold'] == 18].reset_index(drop=True)
-test_df  = df[df['general_strat_fold'] == 19].reset_index(drop=True)
+base_train_df = df[df['protocol_fold'].isin(TRAIN_FOLDS)].reset_index(drop=True)
+train_df = df[df['protocol_fold'].isin(QMODEL_FOLDS)].reset_index(drop=True)
+val_df   = df[df['protocol_fold'] == VALIDATION_FOLD].reset_index(drop=True)
+test_df  = df[df['protocol_fold'] == TEST_FOLD].reset_index(drop=True)
+base_train_df = base_train_df[base_train_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
+train_df = train_df[train_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 val_df   = val_df[val_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 test_df  = test_df[test_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
-print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+print(f"Base train: {len(base_train_df)}, Q-model: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
 
 # ============================================================
 # 2. Dataset & DataLoader
@@ -194,6 +193,8 @@ class TabularDataset(Dataset):
     def __len__(self): return len(self.cont)
     def __getitem__(self, i): return self.cont[i], self.cat[i], self.labels[i]
 
+base_train_loader = DataLoader(TabularDataset(base_train_df, cont_features, cat_features, lbl_itos),
+                          batch_size=BATCH_SIZE, shuffle=False)
 train_loader = DataLoader(TabularDataset(train_df, cont_features, cat_features, lbl_itos),
                           batch_size=BATCH_SIZE, shuffle=False)
 val_loader   = DataLoader(TabularDataset(val_df,  cont_features, cat_features, lbl_itos),
@@ -210,7 +211,7 @@ mlp_cfg = MLPConfig(
     vocab_sizes=[unique_counts[c] for c in cat_features],
     lin_ftrs=LIN_FTRS
 )
-encoder = BasicEncoderStaticMLP(mlp_cfg, shape, target_dim=1).to(DEVICE)
+encoder = BasicEncoderStaticMLP(mlp_cfg, shape, target_dim=2).to(DEVICE)
 encoder.load_state_dict(torch.load(PT_PATH, map_location=DEVICE))
 encoder.eval()
 print(f"Loaded: {PT_PATH}")
@@ -226,9 +227,16 @@ def get_probs_labels(loader):
     return np.concatenate(all_probs, 0), np.concatenate(all_labels, 0)
 
 print("Extracting probabilities...")
+base_train_probs, base_train_labels = get_probs_labels(base_train_loader)
 train_probs, train_labels = get_probs_labels(train_loader)
 val_probs,   val_labels   = get_probs_labels(val_loader)
 test_probs,  test_labels  = get_probs_labels(test_loader)
+
+base_train_prob_icu = base_train_probs[:, ICU24H_IDX]
+base_train_true_icu = base_train_labels[:, ICU24H_IDX]
+base_train_mask = ~np.isnan(base_train_true_icu)
+base_train_prob_icu = base_train_prob_icu[base_train_mask]
+base_train_true_icu = base_train_true_icu[base_train_mask].astype(int)
 
 train_prob_icu = train_probs[:, ICU24H_IDX]
 train_true_icu = train_labels[:, ICU24H_IDX]
@@ -253,7 +261,7 @@ print(f"Val   ICU samples: {len(val_prob_icu)}")
 print(f"Test  ICU samples: {len(test_prob_icu)}")
 
 # ============================================================
-# 4. Calibration: fit Platt + Isotonic on VAL, apply to TRAIN & TEST
+# 4. Calibration: fit Platt + Isotonic on BASE TRAIN, apply to Q-MODEL/VAL/TEST
 # ============================================================
 def compute_ece(y_true, y_prob, n_bins=30):
     bins = np.linspace(0, 1, n_bins + 1)
@@ -266,14 +274,14 @@ def compute_ece(y_true, y_prob, n_bins=30):
     return ece
 
 print("\n" + "=" * 70)
-print("Fitting calibrators on VAL split (Platt + Isotonic)...")
+print("Fitting calibrators on BASE TRAIN split (Platt + Isotonic)...")
 print("=" * 70)
 
 platt = LogisticRegression(max_iter=1000)
-platt.fit(val_prob_icu.reshape(-1, 1), val_true_icu)
+platt.fit(base_train_prob_icu.reshape(-1, 1), base_train_true_icu)
 
 iso = IsotonicRegression(out_of_bounds="clip")
-iso.fit(val_prob_icu, val_true_icu)
+iso.fit(base_train_prob_icu, base_train_true_icu)
 
 train_prob_icu_platt = platt.predict_proba(train_prob_icu.reshape(-1, 1))[:, 1]
 test_prob_icu_platt  = platt.predict_proba(test_prob_icu.reshape(-1, 1))[:, 1]

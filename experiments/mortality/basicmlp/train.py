@@ -10,6 +10,7 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 import config
 import sys
 sys.path.insert(0, config.SRC_DIR)
+from clinical_ts.qmodel_protocol import add_protocol_fold, TRAIN_FOLDS, QMODEL_FOLDS, VALIDATION_FOLD, TEST_FOLD
 
 import torch
 from torch import nn
@@ -26,6 +27,14 @@ from clinical_ts.ts.basic_conv1d_modules.basic_conv1d import bn_drop_lin
 import warnings
 warnings.filterwarnings('ignore')
 import os
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+torch.manual_seed(RANDOM_STATE)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(RANDOM_STATE)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 # ------------------------------------------------------------
 # Model definition
@@ -115,7 +124,8 @@ LR           = 0.001
 WEIGHT_DECAY = 0.001
 DROPOUT      = 0.5
 LIN_FTRS     = [128, 128, 128]
-TARGET_TASK  = "mortality_365d"
+TARGET_TASKS = ["icu_24h", "mortality_365d"]
+TARGET_INDEX = 1
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
@@ -123,7 +133,7 @@ CSV_DIR     = os.path.join(RESULTS_DIR, "csv")
 PNG_DIR     = os.path.join(RESULTS_DIR, "png")
 os.makedirs(CSV_DIR, exist_ok=True)
 os.makedirs(PNG_DIR, exist_ok=True)
-CKPT_DIR    = os.path.join(config.CKPT_ROOT, "mortality", "basicmlp")
+CKPT_DIR    = os.path.join(config.CKPT_ROOT, "multitask", "basicmlp")
 os.makedirs(CKPT_DIR, exist_ok=True)
 
 DATA_PATH   = config.DATA_PATH
@@ -131,7 +141,7 @@ DATA_PATH   = config.DATA_PATH
 # ------------------------------------------------------------
 # 1. Load data
 # ------------------------------------------------------------
-df = pd.read_csv(DATA_PATH, low_memory=False)
+df = add_protocol_fold(pd.read_csv(DATA_PATH, low_memory=False))
 
 input_cols = [c for c in df.columns if c.split("_")[0] in ['biometrics', 'demographics', 'labvalues', 'vitals']]
 
@@ -142,18 +152,14 @@ for c in input_cols:
     df[mask_col] = df[c].notna().astype(float)
     mask_columns.append(mask_col)
 
-df_train     = df[df['general_strat_fold'] < 18]
-train_medians = df_train[input_cols].median().to_dict()
+df_train     = df[df['protocol_fold'].isin(TRAIN_FOLDS)]
+train_medians = df_train[input_cols].median().fillna(0).to_dict()
 train_nans   = [c for c, v in df_train[input_cols].isna().sum().to_dict().items() if v > 0]
 for c in train_nans:
     df.loc[df[c].isna(), c] = train_medians[c]
 df = df.copy()
 
-unique_counts = {c: len(np.unique(np.array(df[c]))) for c in input_cols}
-cat_features  = [c for c, v in unique_counts.items()
-                 if v < 10 and not c.endswith("nan") and not c.startswith("labvalues")]
-cont_features = [c for c in input_cols if c not in cat_features]
-cont_features = cont_features + mask_columns  # mask columns treated as continuous (0/1)
+
 
 df["vitals_acuity"] = df["vitals_acuity"].apply(lambda x: int(x) - 1)
 
@@ -175,18 +181,23 @@ if ethnicity_masks:
     mask_columns = [c for c in mask_columns if c not in ethnicity_masks]
 
 input_cols    = [c for c in df.columns if c.split("_")[0] in ['biometrics', 'demographics', 'labvalues', 'vitals']]
-cat_features  = [c for c in input_cols if c in cat_features]
-cont_features = [c for c in input_cols if c not in cat_features]
-
-df["deterioration_" + TARGET_TASK] = df["deterioration_" + TARGET_TASK].replace(-999., np.nan)
+base_feature_cols = [c for c in input_cols if c not in mask_columns]
+unique_counts = {c: len(np.unique(np.array(df[c]))) for c in base_feature_cols}
+cat_features  = [c for c in base_feature_cols if unique_counts[c] < 10 and not c.startswith("labvalues")]
+cont_features = [c for c in base_feature_cols if c not in cat_features] + mask_columns
+for target_task in TARGET_TASKS:
+    df["deterioration_" + target_task] = df["deterioration_" + target_task].replace(-999., np.nan)
 
 # ------------------------------------------------------------
 # 2. Train / val / test split
 # ------------------------------------------------------------
-train_df = df[df['general_strat_fold'].isin(range(0, 18))].reset_index(drop=True)
-val_df   = df[df['general_strat_fold'] == 18].reset_index(drop=True)
-test_df  = df[df['general_strat_fold'] == 19].reset_index(drop=True)
+train_df = df[df['protocol_fold'].isin(TRAIN_FOLDS)].reset_index(drop=True)
+qmodel_df = df[df['protocol_fold'].isin(QMODEL_FOLDS)].reset_index(drop=True)
+val_df   = df[df['protocol_fold'] == VALIDATION_FOLD].reset_index(drop=True)
+test_df  = df[df['protocol_fold'] == TEST_FOLD].reset_index(drop=True)
 
+train_df = train_df[train_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
+qmodel_df = qmodel_df[qmodel_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 val_df  = val_df[val_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 test_df = test_df[test_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
 
@@ -194,11 +205,12 @@ test_df = test_df[test_df['general_ecg_no_within_stay'] == 0].reset_index(drop=T
 # 3. Dataset
 # ------------------------------------------------------------
 class TabularDataset(Dataset):
-    def __init__(self, df, cont_features, cat_features, target_task):
+    def __init__(self, df, cont_features, cat_features, target_tasks):
         self.cont   = torch.tensor(df[cont_features].values, dtype=torch.float32)
         self.cat    = torch.tensor(df[cat_features].values,  dtype=torch.long)
         self.labels = torch.tensor(
-            df[["deterioration_" + target_task]].values, dtype=torch.float32
+            df[["deterioration_" + task for task in target_tasks]].values,
+            dtype=torch.float32
         )
 
     def __len__(self):
@@ -208,11 +220,13 @@ class TabularDataset(Dataset):
         return self.cont[idx], self.cat[idx], self.labels[idx]
 
 
-train_ds = TabularDataset(train_df, cont_features, cat_features, TARGET_TASK)
-val_ds   = TabularDataset(val_df,   cont_features, cat_features, TARGET_TASK)
-test_ds  = TabularDataset(test_df,  cont_features, cat_features, TARGET_TASK)
+train_ds = TabularDataset(train_df, cont_features, cat_features, TARGET_TASKS)
+qmodel_ds = TabularDataset(qmodel_df, cont_features, cat_features, TARGET_TASKS)
+val_ds   = TabularDataset(val_df,   cont_features, cat_features, TARGET_TASKS)
+test_ds  = TabularDataset(test_df,  cont_features, cat_features, TARGET_TASKS)
 
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
+qmodel_loader = DataLoader(qmodel_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
@@ -242,7 +256,7 @@ mlp_cfg = MLPConfig(
     vocab_sizes=[unique_counts[c] for c in cat_features],
     lin_ftrs=LIN_FTRS
 )
-encoder = BasicEncoderStaticMLP(mlp_cfg, shape, target_dim=1)
+encoder = BasicEncoderStaticMLP(mlp_cfg, shape, target_dim=len(TARGET_TASKS))
 
 # ------------------------------------------------------------
 # 5. Loss & optimizer
@@ -260,8 +274,8 @@ encoder   = encoder.to(device)
 # ------------------------------------------------------------
 # 6. Training loop (checkpoint on best val AUROC)
 # ------------------------------------------------------------
-best_val_auroc_mortality365d = 0
-best_epoch            = 0
+best_val_auroc_mortality365d = -float("inf")
+best_epoch = None
 
 for epoch in range(EPOCHS):
     encoder.train()
@@ -273,6 +287,7 @@ for epoch in range(EPOCHS):
         logits = out["static"]
         loss   = mortality365d_loss(logits, labels)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
         optimizer.step()
         train_loss += loss.item()
 
@@ -289,9 +304,11 @@ for epoch in range(EPOCHS):
     all_preds  = np.concatenate(all_preds,  axis=0)
     all_labels = np.concatenate(all_labels, axis=0)
 
-    mask = ~np.isnan(all_labels[:, 0])
-    if mask.sum() > 0 and len(np.unique(all_labels[mask, 0])) > 1:
-        val_auroc_mortality365d = roc_auc_score(all_labels[mask, 0], all_preds[mask, 0])
+    mask = ~np.isnan(all_labels[:, TARGET_INDEX])
+    if mask.sum() > 0 and len(np.unique(all_labels[mask, TARGET_INDEX])) > 1:
+        val_auroc_mortality365d = roc_auc_score(
+            all_labels[mask, TARGET_INDEX], all_preds[mask, TARGET_INDEX]
+        )
     else:
         val_auroc_mortality365d = float('nan')
 
@@ -300,59 +317,18 @@ for epoch in range(EPOCHS):
 
     if not np.isnan(val_auroc_mortality365d) and val_auroc_mortality365d > best_val_auroc_mortality365d:
         best_val_auroc_mortality365d = val_auroc_mortality365d
-        best_epoch            = epoch + 1
-        torch.save(encoder.state_dict(), os.path.join(CKPT_DIR, "best_basicmlp_mortality365d_only.pt"))
+        best_epoch = epoch + 1
+        torch.save(encoder.state_dict(), os.path.join(CKPT_DIR, "best_basicmlp_joint.pt"))
 
-print(f"Best val AUROC: {best_val_auroc_mortality365d:.4f} at epoch {best_epoch}")
+print(f"Saved best checkpoint at epoch {best_epoch}/{EPOCHS} (val AUROC {best_val_auroc_mortality365d:.4f})")
 
 # ------------------------------------------------------------
 # 7. Inference + Q-model feature export
 # ------------------------------------------------------------
-encoder.load_state_dict(torch.load(os.path.join(CKPT_DIR, "best_basicmlp_mortality365d_only.pt"), map_location=device))
+encoder.load_state_dict(torch.load(os.path.join(CKPT_DIR, "best_basicmlp_joint.pt"), map_location=device))
 encoder.eval()
 
-def find_threshold_for_sensitivity(probs, labels, target_sens=0.80, thr_grid=None):
-    """Scan thresholds on val set and return the one whose sensitivity
-    is closest to target_sens (searching from strict to loose)."""
-    if thr_grid is None:
-        thr_grid = np.arange(0.001, 0.51, 0.001)  # even grid, works well for ~13.8% positive rate
-
-    valid_mask = ~np.isnan(labels)
-    probs  = probs[valid_mask]
-    labels = labels[valid_mask].astype(int)
-
-    best_thr, best_diff, best_sens = None, np.inf, 0
-    for thr in thr_grid:
-        pred = (probs >= thr).astype(int)
-        tp = int(((pred == 1) & (labels == 1)).sum())
-        fn = int(((pred == 0) & (labels == 1)).sum())
-        sens = tp / (tp + fn) if (tp + fn) > 0 else 0
-        diff = abs(sens - target_sens)
-        if diff < best_diff:
-            best_diff = diff
-            best_thr = thr
-            best_sens = sens
-
-    return best_thr, best_sens
-
-
-# Run val inference once to search for the threshold
-val_probs_search, val_labels_search = [], []
-with torch.no_grad():
-    for cont, cat, labels in val_loader:
-        cont, cat = cont.to(device), cat.to(device)
-        probs = torch.sigmoid(encoder(static=cont, static_cat=cat)["static"])
-        val_probs_search.append(probs.cpu().numpy())
-        val_labels_search.append(labels.numpy())
-val_probs_search  = np.concatenate(val_probs_search, axis=0)[:, 0]
-val_labels_search = np.concatenate(val_labels_search, axis=0)[:, 0]
-
-PROB_THRESHOLD, achieved_sens = find_threshold_for_sensitivity(
-    val_probs_search, val_labels_search, target_sens=0.80
-)
-print(f"Selected PROB_THRESHOLD={PROB_THRESHOLD:.3f} (val sensitivity={achieved_sens:.4f}, target=0.80)")
-
-def extract_qmodel_features(loader, df_ref, split_name):
+def extract_qmodel_features(loader, split_name):
     all_probs, all_labels = [], []
 
     with torch.no_grad():
@@ -366,29 +342,14 @@ def extract_qmodel_features(loader, df_ref, split_name):
     all_probs  = np.concatenate(all_probs,  axis=0)
     all_labels = np.concatenate(all_labels, axis=0)
 
-    prob_icu  = all_probs[:, 0]
-    true_icu  = all_labels[:, 0]
-
+    prob_icu = all_probs[:, TARGET_INDEX]
+    true_icu = all_labels[:, TARGET_INDEX]
     valid_mask = ~np.isnan(true_icu)
-    prob_icu  = prob_icu[valid_mask]
-    true_icu  = true_icu[valid_mask]
-
-    pred_icu     = (prob_icu >= PROB_THRESHOLD).astype(int)
-    true_icu_int = true_icu.astype(int)
-    error_label  = (pred_icu != true_icu_int).astype(int)  # base model's prediction was wrong
-
-    tp = int(((pred_icu == 1) & (true_icu_int == 1)).sum())
-    fp = int(((pred_icu == 1) & (true_icu_int == 0)).sum())
-    fn = int(((pred_icu == 0) & (true_icu_int == 1)).sum())
-    tn = int(((pred_icu == 0) & (true_icu_int == 0)).sum())
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-    print(f"[{split_name}] thr={PROB_THRESHOLD} TP={tp} FP={fp} FN={fn} TN={tn} sens={sensitivity:.4f}")
 
     out_df = pd.DataFrame({
-        "prob_mortality365d":  prob_icu,
-        "true_label":   true_icu_int,
-        "pred_label":   pred_icu,
-        "error_label":  error_label,
+        "valid_mask": np.ones(int(valid_mask.sum()), dtype=np.uint8),
+        "prob_mortality365d": prob_icu[valid_mask],
+        "true_label": true_icu[valid_mask].astype(int),
     })
 
     fname = os.path.join(CSV_DIR, f"q_features_{split_name}_basicmlp_mortality365d_only.csv")
@@ -397,8 +358,13 @@ def extract_qmodel_features(loader, df_ref, split_name):
     return out_df
 
 
-val_features  = extract_qmodel_features(val_loader,  val_df,  "val")
-test_features = extract_qmodel_features(test_loader, test_df, "test")
+qmodel_features = extract_qmodel_features(qmodel_loader, "qmodel")
+val_features    = extract_qmodel_features(val_loader, "val")
+test_features   = extract_qmodel_features(test_loader, "test")
+
+print("Done. Q-model input files ready:")
+print(f"  {CSV_DIR}/q_features_qmodel_basicmlp_mortality365d_only.csv  (for training the Q-model)")
+print(f"  {CSV_DIR}/q_features_test_basicmlp_mortality365d_only.csv (for evaluating the Q-model)")
 
 print("Done. Q-model input files ready:")
 print(f"  {CSV_DIR}/q_features_val_basicmlp_mortality365d_only.csv  (for training the Q-model)")
