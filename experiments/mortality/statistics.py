@@ -23,12 +23,12 @@ Output: statistical_tests_summary_mortality365d.csv in ARTIFACTS_DIR,
 one row per base model, with all three test results.
 """
 
-import sys as _sys
+import sys 
 from pathlib import Path as _Path
-_sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 import config
 sys.path.insert(0, config.SRC_DIR)
-from clinical_ts.qmodel_protocol import add_protocol_fold, TRAIN_FOLDS, TEST_FOLD
+from clinical_ts.qmodel_protocol import add_protocol_fold, TRAIN_FOLDS, TEST_FOLD, QMODEL_FOLDS
 import os
 import warnings
 warnings.filterwarnings('ignore')
@@ -261,8 +261,7 @@ for base_model in MODEL_ORDER:
     print(f"\n{'='*70}\n{base_model} | thr={cfg['thr']} | {cfg['strategy']} | {cfg['qtype']}\n{'='*70}")
 
     npz = np.load(cfg['npz'])
-    test_mask_key = 'mask_te' if base_model == 'XGBoost' else 'test_mask'
-    test_mask = npz[test_mask_key]
+    test_mask = npz['test_mask']
 
     # ---- rebuild base tabular TEST features ----
     if base_model == 'XGBoost':
@@ -273,7 +272,7 @@ for base_model in MODEL_ORDER:
         labvalues_columns    = [c for c in df_full.columns if 'labvalues_' in c]
         all_features = demographics_columns + biometrics_columns + vitals_columns + labvalues_columns
         df_full = add_protocol_fold(df_full)
-        selected_folds = df_full[df_full['protocol_fold'].isin(TRAIN_FOLDS)]
+        selected_folds = df_full[df_full['protocol_fold'].isin(QMODEL_FOLDS)]
         medians = selected_folds[all_features].median()
         mask_columns = []
         for col in all_features:
