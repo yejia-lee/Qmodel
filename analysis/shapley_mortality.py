@@ -3,7 +3,13 @@ qmodel_feature_importance_shap_mortality365d.py — Q-model feature
 importance + SHAP analysis for 365d mortality, using the CALIBRATED
 features (original prob + platt + isotonic [+ variance/entropy/spread])
 and the CONFIRMED best (threshold, strategy, model_type) per base model,
-derived from prob_thr_sweep_summary_*_mortality365d_..._WITH_CALIBRATION.csv:
+derived from prob_thr_sweep_summary_*_mortality365d_..._WITH_CALIBRATION.csv.
+
+The winning Q-model is FIT on the Q-model training cohort (fold 16-18,
+"train_*" npz keys), matching how it was selected in the sweep scripts.
+SHAP is then computed on base-positive fold-20 (test) encounters only,
+matching the paper's Methods ("mean absolute SHAP values across
+base-positive fold-20 encounters evaluated by the Q-model").
 
 Unlike the sweep scripts, this script SAVES every winning Q-model it
 trains (joblib for LR/XGB, torch state_dict for MLP) to
@@ -13,8 +19,10 @@ models elsewhere) never needs to retrain from scratch again.
 Outputs:
     qmodels/{base_model}_qmodel.{joblib|pt}      <- saved winning Q-model
     feature_importance_{base_model}.csv           <- XGB gain importance (comparable across all 4)
-    shap_values_{base_model}.npy                  <- raw SHAP values for the winning model type
-    shap_beeswarm_{base_model}.png                 <- per-model SHAP beeswarm plot
+    shap_values_{base_model}.npy                  <- raw SHAP values on fold-20 base-positive encounters
+    shap_importance_{base_model}.csv              <- per-feature mean |SHAP|
+    shap_group_importance_{base_model}.csv        <- feature-group mean |SHAP| and relative attribution R_g
+    shap_beeswarm_{base_model}.png                 <- per-model SHAP beeswarm plot (fold-20 base-positive encounters)
         (y-axis labels now annotated with each feature's mean |SHAP| value, e.g. "prob_mortality365d (1.16)")
     qmodel_feature_importance_top5_4models_comparison_mortality365d.png
 
@@ -35,7 +43,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 import config
 sys.path.insert(0, config.SRC_DIR)
-from clinical_ts.qmodel_protocol import add_protocol_fold, TRAIN_FOLDS, QMODEL_FOLDS
+from clinical_ts.qmodel_protocol import add_protocol_fold, TRAIN_FOLDS, QMODEL_FOLDS, TEST_FOLD
 import os
 import warnings
 warnings.filterwarnings('ignore')
@@ -81,7 +89,7 @@ torch.manual_seed(RANDOM_STATE)
 # ============================================================
 # Shared preprocessing (identical to cali_*_mortality365d.py / qmodel_sweep_*_mortality365d.py)
 # ============================================================
-def load_data_with_mask():
+def load_data_with_mask(fold_set):
     df = add_protocol_fold(pd.read_csv(DATA_PATH, low_memory=False))
     input_cols = [c for c in df.columns if c.split("_")[0] in ['biometrics','demographics','labvalues','vitals']]
 
@@ -91,7 +99,7 @@ def load_data_with_mask():
         df[mask_col] = df[c].notna().astype(float)
         mask_columns.append(mask_col)
 
-    df_train      = df[df['protocol_fold'].isin(QMODEL_FOLDS)]
+    df_train      = df[df['protocol_fold'].isin(TRAIN_FOLDS)]
     train_medians = df_train[input_cols].median().to_dict()
     for c in [c for c, v in df_train[input_cols].isna().sum().items() if v > 0]:
         df.loc[df[c].isna(), c] = train_medians[c]
@@ -115,9 +123,9 @@ def load_data_with_mask():
     cont_features = [c for c in base_feature_cols if c not in cat_features] + mask_columns
     df["deterioration_mortality_365d"] = df["deterioration_mortality_365d"].replace(-999., np.nan)
 
-    train_df = df[df['protocol_fold'].isin(QMODEL_FOLDS)].reset_index(drop=True)
-    train_df = train_df[train_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
-    return train_df, cont_features, cat_features
+    split_df = df[df['protocol_fold'].isin(fold_set)].reset_index(drop=True)
+    split_df = split_df[split_df['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
+    return split_df, cont_features, cat_features
 
 
 # ============================================================
@@ -258,6 +266,31 @@ def average_shap_ensemble(models, model_type, X_background, X_explain, feature_n
     return np.mean(all_sv, axis=0)
 
 
+def build_xgboost_features(fold_set):
+    """Rebuild the raw XGBoost tabular feature matrix (features + mask
+    columns) for a given fold set, before applying any label-validity mask."""
+    df_full = pd.read_csv(DATA_PATH, low_memory=False)
+    demographics_columns = [c for c in df_full.columns if 'demographics_' in c]
+    biometrics_columns   = [c for c in df_full.columns if 'biometrics_' in c]
+    vitals_columns       = [c for c in df_full.columns if 'vitals_' in c]
+    labvalues_columns    = [c for c in df_full.columns if 'labvalues_' in c]
+    all_features = demographics_columns + biometrics_columns + vitals_columns + labvalues_columns
+    df_full = add_protocol_fold(df_full)
+    selected_folds = df_full[df_full['protocol_fold'].isin(TRAIN_FOLDS)]
+    medians = selected_folds[all_features].median()
+    mask_columns = []
+    for col in all_features:
+        mc = col + '_m'
+        df_full[mc] = df_full[col].notna().astype(float)
+        mask_columns.append(mc)
+    df_full[all_features] = df_full[all_features].fillna(medians)
+    all_features_with_mask = all_features + mask_columns
+    split_df_x = df_full[df_full['protocol_fold'].isin(fold_set)].reset_index(drop=True)
+    split_df_x = split_df_x[split_df_x['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
+    x_full = split_df_x[all_features_with_mask].values.astype(np.float32)
+    return x_full, all_features_with_mask
+
+
 all_top5_shap = {}   # model_label -> DataFrame(feature, mean_abs_shap, importance_norm)
 
 MODEL_ORDER = ['BasicMLP', 'Deep Ensemble', 'MC Dropout', 'XGBoost']
@@ -293,15 +326,26 @@ CONFIGS = {
 }
 
 
-EXTRA_COL_KEYS = {
-    'prob':  ('train_prob_icu', 'prob_mortality365d'),
-    'platt': ('train_prob_icu_platt', 'prob_mortality365d_platt'),
-    'iso':   ('train_prob_icu_iso', 'prob_mortality365d_isotonic'),
-    'var':   ('train_var_icu', 'variance'),
-    'std':   ('train_std_icu', 'std_dev'),
-    'ent':   ('train_ent_icu', 'entropy'),
-    'spr':   ('train_spr_icu', 'spread'),
+EXTRA_COL_SUFFIX = {
+    'prob':  ('prob_icu', 'prob_mortality365d'),
+    'platt': ('prob_icu_platt', 'prob_mortality365d_platt'),
+    'iso':   ('prob_icu_iso', 'prob_mortality365d_isotonic'),
+    'var':   ('var_icu', 'variance'),
+    'std':   ('std_icu', 'std_dev'),
+    'ent':   ('ent_icu', 'entropy'),
+    'spr':   ('spr_icu', 'spread'),
 }
+
+# Feature-group membership for the Methods Sec. 3.6.1 group-level SHAP
+# aggregation (R_g). 'encounter' is filled in per base model with the actual
+# clinical/demographic feature + mask-indicator names.
+RISK_SCORE_KEYS = {'prob', 'platt', 'iso'}
+UNCERTAINTY_KEYS = {'var', 'std', 'ent', 'spr'}
+
+
+def npz_key(split, extra_key):
+    suffix, _ = EXTRA_COL_SUFFIX[extra_key]
+    return f"{split}_{suffix}"
 
 for base_model in MODEL_ORDER:
     cfg = CONFIGS[base_model]
@@ -309,64 +353,65 @@ for base_model in MODEL_ORDER:
 
     npz = np.load(cfg['npz'])
 
-    train_mask_key = 'train_mask'
+    train_mask = npz['train_mask']
+    test_mask  = npz['test_mask']
 
-    train_mask = npz[train_mask_key]
-
-    # ---- rebuild base tabular features ----
+    # ---- rebuild base tabular features, for both the Q-model fit cohort
+    #      (train = fold 16-18) and the SHAP explanation cohort (test = fold 20) ----
     if base_model == 'XGBoost':
-        df_full = pd.read_csv(DATA_PATH, low_memory=False)
-        demographics_columns = [c for c in df_full.columns if 'demographics_' in c]
-        biometrics_columns   = [c for c in df_full.columns if 'biometrics_' in c]
-        vitals_columns       = [c for c in df_full.columns if 'vitals_' in c]
-        labvalues_columns    = [c for c in df_full.columns if 'labvalues_' in c]
-        all_features = demographics_columns + biometrics_columns + vitals_columns + labvalues_columns
-        df_full = add_protocol_fold(df_full)
-        selected_folds = df_full[df_full['protocol_fold'].isin(QMODEL_FOLDS)]
-        medians = selected_folds[all_features].median()
-        mask_columns = []
-        for col in all_features:
-            mc = col + '_m'
-            df_full[mc] = df_full[col].notna().astype(float)
-            mask_columns.append(mc)
-        df_full[all_features] = df_full[all_features].fillna(medians)
-        all_features_with_mask = all_features + mask_columns
-        train_df_x = df_full[df_full['protocol_fold'].isin(QMODEL_FOLDS)].reset_index(drop=True)
-        train_df_x = train_df_x[train_df_x['general_ecg_no_within_stay'] == 0].reset_index(drop=True)
-        x_train_full = train_df_x[all_features_with_mask].values.astype(np.float32)
-        assert len(train_mask) == len(x_train_full), "mask/df length mismatch for XGBoost — stop."
+        x_train_full, base_feature_names = build_xgboost_features(QMODEL_FOLDS)
+        x_test_full, _                   = build_xgboost_features((TEST_FOLD,))
+        assert len(train_mask) == len(x_train_full), "train mask/df length mismatch for XGBoost — stop."
+        assert len(test_mask) == len(x_test_full), "test mask/df length mismatch for XGBoost — stop."
         X_train_base = x_train_full[train_mask]
-        base_feature_names = all_features_with_mask
+        X_test_base  = x_test_full[test_mask]
     else:
-        train_df, cont_features, cat_features = load_data_with_mask()
-        assert len(train_mask) == len(train_df), f"mask/df length mismatch for {base_model} — stop."
+        train_df, cont_features, cat_features = load_data_with_mask(QMODEL_FOLDS)
+        test_df, _, _                         = load_data_with_mask((TEST_FOLD,))
+        assert len(train_mask) == len(train_df), f"train mask/df length mismatch for {base_model} — stop."
+        assert len(test_mask) == len(test_df), f"test mask/df length mismatch for {base_model} — stop."
         train_df_masked = train_df[train_mask].reset_index(drop=True)
+        test_df_masked  = test_df[test_mask].reset_index(drop=True)
+        base_feature_names = cont_features + cat_features
         X_train_base = np.hstack([
             train_df_masked[cont_features].values.astype(np.float32),
             train_df_masked[cat_features].values.astype(np.float32)
         ])
-        base_feature_names = cont_features + cat_features
+        X_test_base = np.hstack([
+            test_df_masked[cont_features].values.astype(np.float32),
+            test_df_masked[cat_features].values.astype(np.float32)
+        ])
 
-    # ---- assemble extra prob/uncertainty columns ----
-    extra_arrays = []
-    extra_names  = []
+    # ---- assemble extra prob/uncertainty columns, separately for train and test ----
+    extra_names = []
+    train_extra_arrays = []
+    test_extra_arrays  = []
     for key in cfg['extra_cols']:
-        npz_key, display_name = EXTRA_COL_KEYS[key]
-        extra_arrays.append(npz[npz_key].reshape(-1, 1))
+        _, display_name = EXTRA_COL_SUFFIX[key]
         extra_names.append(display_name)
+        train_extra_arrays.append(npz[npz_key('train', key)].reshape(-1, 1))
+        test_extra_arrays.append(npz[npz_key('test', key)].reshape(-1, 1))
 
-    X_train_q = np.hstack([X_train_base] + extra_arrays).astype(np.float32)
+    X_train_q = np.hstack([X_train_base] + train_extra_arrays).astype(np.float32)
+    X_test_q_all = np.hstack([X_test_base] + test_extra_arrays).astype(np.float32)
     feature_names = base_feature_names + extra_names
 
     train_true = npz['train_true_icu']
-    train_prob = npz[EXTRA_COL_KEYS['prob'][0]]
-
+    train_prob = npz[npz_key('train', 'prob')]
     train_pred = (train_prob >= cfg['thr']).astype(int)
     train_err  = (train_pred != train_true).astype(int)
 
-    print(f"  Q-model feature matrix: {X_train_q.shape}, error rate: {train_err.mean():.4f}")
+    # Restrict the SHAP explanation cohort to base-positive fold-20
+    # encounters only, matching the Methods definition of the alarm set
+    # A_tau that the Q-model actually operates on.
+    test_prob = npz[npz_key('test', 'prob')]
+    test_alarm = test_prob >= cfg['thr']
+    X_test_q = X_test_q_all[test_alarm]
 
-    # ---- train + save the winning Q-model (per confirmed strategy) ----
+    print(f"  Q-model fit matrix (fold16-18): {X_train_q.shape}, error rate: {train_err.mean():.4f}")
+    print(f"  SHAP explanation matrix (fold-20 base-positive): {X_test_q.shape}")
+
+    # ---- train + save the winning Q-model (per confirmed strategy), fit on fold16-18 ----
     save_prefix = os.path.join(QMODEL_DIR, base_model.replace(' ', '').lower() + "_mortality365d")
 
     if cfg['strategy'] == 'Single':
@@ -389,7 +434,7 @@ for base_model in MODEL_ORDER:
                 m = train_and_save_lr(X_train_q[tri], train_err[tri], path)
                 winning_models.append(m)
 
-    # ---- (1) XGB gain importance, ALWAYS via a fresh plain XGB fit ----
+    # ---- (1) XGB gain importance, ALWAYS via a fresh plain XGB fit on the fit cohort ----
     imp = xgb_gain_importance(X_train_q, train_err, feature_names)
     imp_df = pd.DataFrame({'feature': feature_names, 'importance_gain': imp}).sort_values(
         'importance_gain', ascending=False)
@@ -397,13 +442,16 @@ for base_model in MODEL_ORDER:
                   index=False)
     print(imp_df.head(5).to_string(index=False))
 
-    # ---- (2) SHAP using the ACTUAL winning model type ----
+    # ---- (2) SHAP using the ACTUAL winning model type, explained on
+    #      base-positive fold-20 encounters (Methods Sec. 3.6) ----
     rng = np.random.default_rng(RANDOM_STATE)
-    n = X_train_q.shape[0]
-    bg_idx  = rng.choice(n, size=min(SHAP_BACKGROUND_N, n), replace=False)
-    exp_idx = rng.choice(n, size=min(SHAP_EXPLAIN_N, n), replace=False)
+    n_bg = X_train_q.shape[0]
+    bg_idx = rng.choice(n_bg, size=min(SHAP_BACKGROUND_N, n_bg), replace=False)
     X_bg  = X_train_q[bg_idx]
-    X_exp = X_train_q[exp_idx]
+
+    n_exp = X_test_q.shape[0]
+    exp_idx = rng.choice(n_exp, size=min(SHAP_EXPLAIN_N, n_exp), replace=False)
+    X_exp = X_test_q[exp_idx]
 
     print(f"  Computing SHAP ({cfg['qtype']}, {'Ensemble avg' if cfg['strategy']=='Ensemble' else 'single'})...")
     if cfg['strategy'] == 'Single':
@@ -426,11 +474,33 @@ for base_model in MODEL_ORDER:
                    index=False)
     print(shap_df.head(5).to_string(index=False))
 
+    # ---- (3) group-level SHAP aggregation (Methods Sec. 3.6.1, R_g) ----
+    feature_group = {}
+    for f in base_feature_names:
+        feature_group[f] = 'encounter'
+    for key in cfg['extra_cols']:
+        _, display_name = EXTRA_COL_SUFFIX[key]
+        feature_group[display_name] = 'risk_score' if key in RISK_SCORE_KEYS else 'uncertainty'
+
+    group_df = shap_df.copy()
+    group_df['group'] = group_df['feature'].map(feature_group)
+    group_sums = group_df.groupby('group')['mean_abs_shap'].sum()
+    total = group_sums.sum()
+    group_summary = pd.DataFrame({
+        'group': group_sums.index,
+        'sum_mean_abs_shap': group_sums.values,
+        'R_g': group_sums.values / total,
+    }).sort_values('R_g', ascending=False)
+    group_summary.to_csv(
+        os.path.join(ARTIFACTS_DIR, f"shap_group_importance_{base_model.replace(' ', '').lower()}_mortality365d.csv"),
+        index=False)
+    print(group_summary.to_string(index=False))
+
     top5_shap = shap_df.nlargest(5, 'mean_abs_shap').copy()
     top5_shap['importance_norm'] = top5_shap['mean_abs_shap'] / top5_shap['mean_abs_shap'].max()
     all_top5_shap[base_model] = top5_shap[['feature', 'mean_abs_shap', 'importance_norm']]
 
-    # ---- per-model beeswarm plot ----
+    # ---- per-model beeswarm plot (fold-20 base-positive encounters) ----
     try:
         plt.figure()
         shap.summary_plot(shap_vals, X_exp, feature_names=feature_names, show=False, max_display=5)
@@ -458,7 +528,7 @@ for base_model in MODEL_ORDER:
         print(f"  [warn] beeswarm plot failed: {e}")
 
     if base_model != 'XGBoost':
-        del train_df
+        del train_df, test_df
     torch.cuda.empty_cache()
 
 
